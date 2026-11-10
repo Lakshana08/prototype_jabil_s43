@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Smart Material AI Chat</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">JABIL</span>
+      <span class="divider"></span>
+      <div>
+        <div class="app-name">Smart Material AI Chat</div>
+        <div class="app-sub">Suzhou GP Plant</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="conn" class="conn conn-wait" title="Connecting…">Logged in as <b>Planner</b></span>
+      <button id="newChat" class="btn-ghost" type="button">New chat</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <section class="panel">
+        <h2>About</h2>
+        <div id="agentDesc" class="about">
+          <h3>Smart Material AI Chat</h3>
+          <p>Ask questions in plain language. Get instant insights into material shortages, inventory, work orders,
+             and inbound movements — powered by integrated SAP data.</p>
+          <p class="about-lead">Ask me about:</p>
+          <ul>
+            <li><b>Shortages:</b> What's missing for a work order?</li>
+            <li><b>Inventory:</b> What stock is available and where?</li>
+            <li><b>Aged Stock:</b> Which materials have been sitting unused?</li>
+            <li><b>Over-Issues:</b> Where has material been issued beyond requirements?</li>
+            <li><b>Inbound Status:</b> What materials are pending receipt?</li>
+            <li><b>Production Orders:</b> What's the current order and material status?</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Try asking</h2>
+        <div id="examples" class="examples"></div>
+      </section>
+    </aside>
+
+    <main class="chat">
+      <div id="messages" class="messages" aria-live="polite">
+        <div class="welcome">
+          <h1>What would you like to know?</h1>
+          <p>Ask about work order shortage, aged material, over-issued material, production orders or material stock.
+             Any answer can be downloaded as a report.</p>
+        </div>
+      </div>
+
+      <form id="composer" class="composer">
+        <textarea id="input" rows="1" placeholder="e.g. What is short for work order 121060001, and what is aged?" required></textarea>
+        <button id="send" class="btn-primary" type="submit">Ask</button>
+      </form>
+    </main>
+
+    <aside class="steps-pane">
+      <section class="panel">
+        <h2>Agent steps</h2>
+        <div id="stepsPane"><p class="muted">The steps the agent takes for your latest question show up here.</p></div>
+      </section>
+    </aside>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
