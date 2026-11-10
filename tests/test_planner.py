@@ -6,9 +6,13 @@ Run:  python -m unittest discover -s tests -v
 import asyncio
 import base64
 import json
+import os
 import unittest
 
-from app.main import app, planner, repo
+# The assertions below are tied to the Sample_data snapshot, not to live S43 data.
+os.environ["DATA_SOURCE"] = "file"
+
+from app.main import app, planner, repo  # noqa: E402
 from app.planner import intents, rules
 
 
