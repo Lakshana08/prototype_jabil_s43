@@ -1,5 +1,7 @@
 """FastAPI entry point: exposes the Planner agent over A2A at /a2a/planner."""
+import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,15 +10,42 @@ from fastapi.staticfiles import StaticFiles
 
 from app import config
 from app.a2a.server import PROTOCOL_VERSION, create_a2a_router
-from app.data.repository import DataRepository
+from app.data.repository import DataLoadError, DataRepository
 from app.planner.agent import PlannerAgent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 PLANNER_PATH = "/a2a/planner"
 
-repo = DataRepository.load(config.DATA_DIR)
+log = logging.getLogger(__name__)
+
+try:
+    repo = DataRepository.from_config()
+except DataLoadError as exc:
+    # One readable line instead of a long traceback; the server cannot start without data.
+    raise SystemExit(f"\nCannot start - backend data could not be loaded:\n  {exc}\n") from None
 planner = PlannerAgent(repo, config.AGING_THRESHOLD_DAYS)
+
+
+async def _refresh_loop(minutes: float) -> None:
+    """Periodically re-read live S43 data; a failed refresh keeps serving the last good data."""
+    while True:
+        await asyncio.sleep(minutes * 60)
+        try:
+            await asyncio.to_thread(planner.refresh_data)
+            log.info("Refreshed S43 data (as of %s)", repo.data_as_of)
+        except Exception:  # noqa: BLE001 - keep the server up on SAP outages
+            log.exception("S43 data refresh failed - keeping data as of %s", repo.data_as_of)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    task = None
+    if repo.is_live and config.DATA_REFRESH_MINUTES > 0:
+        task = asyncio.create_task(_refresh_loop(config.DATA_REFRESH_MINUTES))
+    yield
+    if task:
+        task.cancel()
 
 
 def planner_card() -> dict:
@@ -69,7 +98,7 @@ def planner_card() -> dict:
     }
 
 
-app = FastAPI(title="Smart Material AI Chat - A2A Agents", version="1.0.0")
+app = FastAPI(title="Smart Material AI Chat - A2A Agents", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
 app.include_router(create_a2a_router(PLANNER_PATH, planner_card(), planner.handle))
 

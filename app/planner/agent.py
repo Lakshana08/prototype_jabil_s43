@@ -84,6 +84,11 @@ class PlannerAgent:
         self.repo = repo
         self.service = PlannerService(repo, aging_threshold_days)
 
+    def refresh_data(self) -> None:
+        """Re-read the backend (live S43) and rebuild the service's derived lookups."""
+        self.repo.reload()
+        self.service = PlannerService(self.repo, self.service.aging_threshold)
+
     # ------------------------------------------------------------------ entry point
     def handle(self, text: str, structured: dict | None = None) -> AgentReply:
         structured = structured or {}
