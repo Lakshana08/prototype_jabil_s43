@@ -9,6 +9,7 @@ returns the resulting Task.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -67,7 +68,7 @@ def create_a2a_router(base_path: str, agent_card: dict, handler: Callable[[str, 
             return _error_response(None, RpcError(PARSE_ERROR, "Parse error: body is not valid JSON"))
 
         if isinstance(body, dict) and "jsonrpc" not in body and ("query" in body or "text" in body):
-            task = _run(_simple_message(body), handler, tasks)
+            task = await asyncio.to_thread(_run, _simple_message(body), handler, tasks)
             return JSONResponse(task)
 
         req_id = body.get("id") if isinstance(body, dict) else None
@@ -79,7 +80,7 @@ def create_a2a_router(base_path: str, agent_card: dict, handler: Callable[[str, 
                 message = _validate_message(params)
                 return StreamingResponse(_stream(req_id, message, handler, tasks), media_type="text/event-stream")
             if method == "message/send":
-                result = _run(_validate_message(params), handler, tasks)
+                result = await asyncio.to_thread(_run, _validate_message(params), handler, tasks)
             elif method == "tasks/get":
                 result = _get_task(params, tasks)
             elif method == "tasks/cancel":
@@ -106,7 +107,7 @@ def _run(message: dict, handler, tasks: OrderedDict) -> dict:
     task_id = message.get("taskId") or _id()
     context_id = message.get("contextId") or _id()
     try:
-        reply = handler(text, structured)
+        reply = handler(text, structured, context_id)
     except ValueError as exc:  # bad skill parameters -> the agent asks for input, not a crash
         return _store(tasks, _task(task_id, context_id, message, "input-required", _agent_message(
             str(exc), task_id, context_id), []))
@@ -125,7 +126,7 @@ async def _stream(req_id, message: dict, handler, tasks: OrderedDict):
     yield event(_task(task_id, context_id, message, "submitted", None, []))
     yield event(_status_event(task_id, context_id, "working", None, final=False))
     try:
-        task = _run(message, handler, tasks)
+        task = await asyncio.to_thread(_run, message, handler, tasks)
     except Exception:
         correlation = _id()
         log.exception("A2A stream error correlationId=%s", correlation)

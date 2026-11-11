@@ -301,8 +301,7 @@ class PlannerService:
             [[r["WorkOrder"], r["OrderType"], r["Material"], r["MRPController"], r["ScheduledStart"],
               r["ShortComponents"], r["NeedExpedite"], r["ShortMaterials"]] for r in rows])
         if rows:
-            lines += ["", "_Expedite = warehouse stock insufficient; others can be replenished from warehouse via ZPL. "
-                          "Ask about a specific work order for root cause._"]
+            lines += ["", "_Expedite = warehouse stock insufficient; others can be replenished from warehouse via ZPL._"]
         exp_orders = [r for r in rows if r["NeedExpedite"]]
         actions = []
         if exp_orders:
@@ -312,8 +311,6 @@ class PlannerService:
             actions.append(f"Create pull lists (ZPL) for the remaining "
                            f"{sum(r['ReplenishFromWarehouse'] for r in rows)} short line(s) - stock is in the warehouse.")
             actions.append(f"Earliest affected start: work order {rows[0]['WorkOrder']} on {rows[0]['ScheduledStart']}.")
-            actions.append("Ask about a single work order (e.g. \"What is short for work order "
-                           f"{rows[0]['WorkOrder']}?\") to see the root cause per component.")
         scope = _scope(mrp=mrp, order_types=order_types, materials=materials)
         if rows:
             para = [f"{fmt(len(rows))} of the {_plural(len(orders), 'work order')}{scope} "
@@ -326,8 +323,7 @@ class PlannerService:
             if len(exp_orders) < len(rows):
                 para.append(("For the rest" if exp_orders else "For all of them")
                             + ", the missing parts are in the warehouse and only need to be moved to the production line.")
-            para.append(f"The earliest affected order is {rows[0]['WorkOrder']}, starting on {rows[0]['ScheduledStart']}. "
-                        f"Ask about a single work order to see exactly what is missing.")
+            para.append(f"The earliest affected order is {rows[0]['WorkOrder']}, starting on {rows[0]['ScheduledStart']}.")
             headline = " ".join(para)
         else:
             headline = f"Good news: none of the {_plural(len(orders), 'work order')}{scope} is short of material."
@@ -614,7 +610,7 @@ class PlannerService:
         if "NMVT" in codes:
             actions.append("Order has user status NMVT (no movement) - it is excluded from shortage control.")
         if "MSPT" in codes:
-            actions.append(f"Order has missing parts - ask \"What is short for work order {order}?\" for details.")
+            actions.append("Order has missing parts (MSPT).")
         dq_comps = [c for c in comps if c["dataQualityIssue"]]
         if dq_comps:
             actions.append("Fix master data: " + ", ".join(f"{c['material']} ({c['dataQualityIssue']})" for c in dq_comps) + ".")
@@ -627,8 +623,7 @@ class PlannerService:
                            f"So far {fmt(header['confirmedYield'])} have been completed ({progress:.0f}%)"
                            + (f", with {fmt(header['confirmedScrap'])} scrapped." if header["confirmedScrap"] else "."),
                            f"It is scheduled to run from {header['scheduledStart']} to {header['scheduledEnd']}.",
-                           (f"Some materials are still missing for this order; ask \"What is short for work order "
-                            f"{order}?\" to see which ones.") if "MSPT" in codes else "",
+                           "Some materials are still missing for this order." if "MSPT" in codes else "",
                            "It is marked as having no stock movement, so it is left out of shortage checks."
                            if "NMVT" in codes else "",
                            ("The material data needs correcting for " + _names(
@@ -796,7 +791,7 @@ class PlannerService:
                        headline=(f"I could not find work order {order}. Please check the number - work orders "
                                  f"available right now run from {min(self.repo.production_order_by_order)} to "
                                  f"{max(self.repo.production_order_by_order)}."),
-                       actions=["Check the number - valid orders in this snapshot run from "
+                       actions=["Check the number - valid orders in S43 run from "
                                 f"{min(self.repo.production_order_by_order)} to {max(self.repo.production_order_by_order)}."],
                        severity="info")
 

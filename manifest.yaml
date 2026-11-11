@@ -1,0 +1,38 @@
+---
+# SAP BTP Cloud Foundry deployment.
+# Uses the EXISTING subaccount destination named in SAP_DESTINATION_NAME (no destination is created).
+# Binds the existing service instances below (no services are created).
+# Then:  cf push
+applications:
+  - name: smart-material-chat-s43
+    memory: 512M
+    disk_quota: 1G
+    instances: 1
+    buildpacks:
+      - python_buildpack
+    # start command comes from Procfile; Python version from runtime.txt
+    health-check-type: http
+    health-check-http-endpoint: /health
+    timeout: 180            # first S43 data load runs at startup
+    random-route: true
+    services:
+      - smart-material-ai-destination    # Destination service - used to read the existing destination
+      - smart-material-ai-connectivity   # Connectivity service - proxy to the SAP Cloud Connector
+    env:
+      SAP_DESTINATION_NAME: S43   # must match the existing destination name exactly (case-sensitive)
+      SAP_ODATA_SERVICE_PATH: /sap/opu/odata/sap/ZSB_SMC_MATERIAL_V2
+      SAP_CLIENT: "100"     # used only if the destination has no sap-client property
+      SAP_TIMEOUT_SECONDS: "60"
+      DATA_REFRESH_MINUTES: "15"
+      AGING_THRESHOLD_DAYS: "14"
+      PLANT: CN16
+      # LLM (SAP AI Core) - secrets are NOT kept here; set once, then restage:
+      #   cf set-env smart-material-chat-s43 AICORE_CLIENT_ID '<id>'
+      #   cf set-env smart-material-chat-s43 AICORE_CLIENT_SECRET '<secret>'
+      AICORE_AUTH_URL: https://gen-ai.authentication.us10.hana.ondemand.com/oauth/token
+      AICORE_BASE_URL: https://api.ai.prod.us-east-1.aws.ml.hana.ondemand.com/v2
+      AICORE_RESOURCE_GROUP: default
+      LLM_DEPLOYMENT_ID: d38dd2015862a15d
+      # Set to the app route after the first push, e.g.:
+      #   cf set-env smart-material-ai-chat PUBLIC_BASE_URL https://<route> && cf restage smart-material-ai-chat
+      # PUBLIC_BASE_URL: https://smart-material-ai-chat.cfapps.<region>.hana.ondemand.com

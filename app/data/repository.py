@@ -2,32 +2,22 @@
 
 Reads the planner data from the live S43 OData V2 service ``ZSB_SMC_MATERIAL_V2``
 (CDS views ZC_SMC_*, see ``SMC_All_OData_URLs_Complete 3.xlsx``) and builds lookup indexes.
-Each source is read with ``$expand`` so it arrives in the same nested shape as the old
-sample JSON files; an offline JSON snapshot can still be used with ``DATA_SOURCE=file``.
+Each source is read with ``$expand`` so it arrives in the nested shape the rules expect.
 The business rules in ``app.planner.rules`` only see this repository, so the data source
 does not change any rule logic.
 """
 from __future__ import annotations
 
-import json
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import cached_property
 from datetime import datetime, timezone
-from pathlib import Path
 
 from app.data.odata import ODataClient, ODataError
 
 log = logging.getLogger(__name__)
 
-# Offline snapshot files (DATA_SOURCE=file).
-SOURCES = {
-    "work_order_shortage": "WorkOrderShortage.json",
-    "production_order": "ProductionOrder.json",
-    "material_master": "MaterialMaster.json",
-    "inventory": "Inventory.json",
-}
 
 # Live S43 OData V2 entity sets + $expand (rows 16-28 of SMC_All_OData_URLs_Complete 3.xlsx,
 # column "Same nested shape as JSON ($expand) - V2").
@@ -64,7 +54,6 @@ class SourceInfo:
 
 @dataclass
 class DataRepository:
-    data_dir: Path | None = None
     odata: ODataClient | None = None
     shortage_by_order: dict[str, dict] = field(default_factory=dict)
     production_order_by_order: dict[str, dict] = field(default_factory=dict)
@@ -75,16 +64,6 @@ class DataRepository:
     sources: dict[str, SourceInfo] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ loading
-    @classmethod
-    def load(cls, data_dir: Path) -> "DataRepository":
-        """Load the offline JSON snapshot from ``data_dir``."""
-        repo = cls(data_dir=Path(data_dir))
-        raw = {key: repo._read_source(key, name) for key, name in SOURCES.items()}
-        repo._index(raw)
-        log.info("Loaded backend data from %s: %s", data_dir,
-                 {k: v.record_count for k, v in repo.sources.items()})
-        return repo
-
     @classmethod
     def from_odata(cls, client: ODataClient) -> "DataRepository":
         """Load live data from the S43 OData service."""
@@ -99,10 +78,8 @@ class DataRepository:
     @classmethod
     def from_config(cls) -> "DataRepository":
         from app import config  # local import: config is optional for library use
-        if config.DATA_SOURCE == "file":
-            return cls.load(config.DATA_DIR)
-        if config.DATA_SOURCE != "odata":
-            raise DataLoadError(f"Unknown DATA_SOURCE {config.DATA_SOURCE!r} (use 'odata' or 'file')")
+        if config.SAP_DESTINATION_NAME:
+            return cls.from_odata(_destination_client(config))
         if not config.SAP_USER:
             log.warning("SAP_USER is not set - S43 will most likely answer 401 Unauthorized")
         return cls.from_odata(ODataClient(
@@ -119,7 +96,7 @@ class DataRepository:
 
         On failure the current data is kept and the error is raised to the caller.
         """
-        fresh = DataRepository.from_odata(self.odata) if self.is_live else DataRepository.load(self.data_dir)
+        fresh = DataRepository.from_odata(self.odata)
         stale = set(self.__dict__) - set(fresh.__dict__)  # cached_property values
         self.__dict__.update(fresh.__dict__)
         for key in stale:
@@ -162,29 +139,6 @@ class DataRepository:
         if missing:
             raise DataLoadError(f"{name}: records missing required fields {missing}")
 
-    def _read_source(self, key: str, filename: str) -> list[dict]:
-        path = self.data_dir / filename
-        if not path.exists():
-            raise DataLoadError(f"Missing source file: {path}")
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            envelope = payload["d"]
-            results = envelope["results"]
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise DataLoadError(f"{filename}: not an OData 'd.results' payload ({exc})") from exc
-
-        self._check_required(key, filename, results)
-
-        loaded_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
-        self.sources[key] = SourceInfo(
-            file=filename,
-            entity=envelope.get("entity", ""),
-            record_count=len(results),
-            generated_on=envelope.get("generatedOn", ""),
-            loaded_at=loaded_at,
-        )
-        return results
-
     # ------------------------------------------------------------------ lookups
     @property
     def data_as_of(self) -> str:
@@ -194,8 +148,7 @@ class DataRepository:
 
     def provenance(self) -> dict:
         return {
-            "dataSource": ("Live SAP S43 (OData ZSB_SMC_MATERIAL_V2)" if self.is_live
-                           else "Uploaded snapshot (sample_data) - not live SAP"),
+            "dataSource": "Live SAP S43 (OData ZSB_SMC_MATERIAL_V2)",
             "dataAsOf": self.data_as_of,
             "sources": {k: vars(v) for k, v in self.sources.items()},
         }
@@ -238,3 +191,17 @@ def _nav(record: dict, prop: str) -> list[dict]:
 
 
 nav = _nav
+
+
+def _destination_client(config) -> ODataClient:
+    """ODataClient for S43 reached through the SAP BTP destination ``SAP_DESTINATION_NAME``."""
+    from app.data.destination import Destination, DestinationError
+    try:
+        dest = Destination(config.SAP_DESTINATION_NAME, timeout=config.SAP_TIMEOUT_SECONDS)
+    except DestinationError as exc:
+        raise DataLoadError(str(exc)) from exc
+    path = "/" + config.SAP_ODATA_SERVICE_PATH.strip("/")
+    base_url = dest.url if dest.url.endswith(path) else dest.url + path
+    client = dest.config.get("sap-client") or config.SAP_CLIENT
+    return ODataClient(base_url=base_url, client=client, verify_ssl=config.SAP_VERIFY_SSL,
+                       timeout=config.SAP_TIMEOUT_SECONDS, destination=dest)

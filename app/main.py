@@ -25,6 +25,16 @@ except DataLoadError as exc:
     # One readable line instead of a long traceback; the server cannot start without data.
     raise SystemExit(f"\nCannot start - backend data could not be loaded:\n  {exc}\n") from None
 planner = PlannerAgent(repo, config.AGING_THRESHOLD_DAYS)
+if config.LLM_ENABLED:
+    from app.llm.aicore import AICoreChat
+    from app.planner.llm_planner import LLMPlanner
+    planner.llm = LLMPlanner(planner, AICoreChat(
+        config.AICORE_AUTH_URL, config.AICORE_CLIENT_ID, config.AICORE_CLIENT_SECRET, config.AICORE_BASE_URL,
+        config.LLM_DEPLOYMENT_ID, config.AICORE_RESOURCE_GROUP, config.LLM_TIMEOUT_SECONDS),
+        history_turns=config.LLM_HISTORY_TURNS)
+    log.info("LLM enabled: AI Core deployment %s", config.LLM_DEPLOYMENT_ID)
+else:
+    log.info("LLM disabled (AICORE_* not set) - using the rule-based router")
 
 
 async def _refresh_loop(minutes: float) -> None:
@@ -101,6 +111,15 @@ def planner_card() -> dict:
 app = FastAPI(title="Smart Material AI Chat - A2A Agents", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
 app.include_router(create_a2a_router(PLANNER_PATH, planner_card(), planner.handle))
+
+
+@app.middleware("http")
+async def no_stale_ui(request, call_next):
+    """Browsers must revalidate the chat UI files, so a redeploy is picked up without a hard refresh."""
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/ui"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 @app.get("/health")
