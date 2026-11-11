@@ -2,7 +2,7 @@
 
 Reads entity sets from the S43 service ``ZSB_SMC_MATERIAL_V2`` (see
 ``SMC_All_OData_URLs_Complete 3.xlsx``) and normalises the SAP V2 JSON wire format to
-the plain shape the business rules expect (the same shape as the old sample JSON files):
+the plain shape the business rules expect:
 
 * ``Edm.Decimal`` / ``Edm.Double`` / ``Edm.Int64`` arrive as strings -> converted to numbers
   using the service ``$metadata``.
@@ -37,8 +37,11 @@ class ODataError(RuntimeError):
 
 class ODataClient:
     def __init__(self, base_url: str, client: str, user: str = "", password: str = "",
-                 verify_ssl: bool | str = True, timeout: float = 60.0):
+                 verify_ssl: bool | str = True, timeout: float = 60.0, destination=None):
         self.base_url = base_url.rstrip("/")
+        # Optional app.data.destination.Destination: adds its auth / connectivity-proxy headers
+        # and routes requests through the BTP Connectivity proxy (OnPremise destinations).
+        self.destination = destination
         self.client = client
         self.timeout = timeout
         self._headers = {"Accept": "application/json"}
@@ -51,6 +54,10 @@ class ODataClient:
             self._ssl = ssl.create_default_context(cafile=verify_ssl)
         else:
             self._ssl = ssl.create_default_context()
+        handlers: list = [urllib.request.HTTPSHandler(context=self._ssl)]
+        if destination is not None and destination.proxies():
+            handlers.insert(0, urllib.request.ProxyHandler(destination.proxies()))
+        self._opener = urllib.request.build_opener(*handlers)
         self._types: dict[str, dict[str, str]] | None = None
 
     # ------------------------------------------------------------------ public
@@ -82,9 +89,14 @@ class ODataClient:
         headers = dict(self._headers)
         if accept:
             headers["Accept"] = accept
+        if self.destination is not None:
+            try:
+                headers.update(self.destination.request_headers())
+            except Exception as exc:  # noqa: BLE001 - surface as a data-load error
+                raise ODataError(f"BTP destination {self.destination.name!r}: {exc}") from exc
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl) as resp:
+            with self._opener.open(req, timeout=self.timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):

@@ -197,15 +197,27 @@
     const row = push(agentRow(card));
     if (data.trace?.length) {
       card.innerHTML = `<div class="typing"><span></span><span></span><span></span></div>`;
-      await playSteps(data.trace, ms, question);
+      await playSteps(data.trace, ms, question, data);
       card.innerHTML = "";
     }
 
     const body = el("div", "card-body md answer-reveal");
-    const { intro, sections } = splitSections(textPart?.text || "");
-    if (intro) body.appendChild(htmlBlock(renderMarkdown(intro)));
-    sections.forEach((sec, i) => body.appendChild(renderSection(sec, results[i])));
-    if (!sections.length && !intro) body.appendChild(htmlBlock(renderMarkdown(textPart?.text || "")));
+    if (data.answeredBy === "llm") {
+      // The LLM wrote one answer for the whole question: show it as written (its own headings and tables).
+      const worst = results.map((r) => r.severity).find((sv) => sv === "critical")
+        || results.map((r) => r.severity).find((sv) => sv === "warning");
+      if (STATUS[worst]) {
+        body.appendChild(htmlBlock(`<span class="status status-${STATUS[worst][1]}">${STATUS[worst][0]}</span>`));
+      }
+      const answer = htmlBlock(renderMarkdown(stripFooter(textPart?.text || "")));
+      answer.classList.add("llm-answer");
+      body.appendChild(answer);
+    } else {
+      const { intro, sections } = splitSections(textPart?.text || "");
+      if (intro) body.appendChild(htmlBlock(renderMarkdown(intro)));
+      sections.forEach((sec, i) => body.appendChild(renderSection(sec, results[i])));
+      if (!sections.length && !intro) body.appendChild(htmlBlock(renderMarkdown(textPart?.text || "")));
+    }
     card.appendChild(body);
 
     // footer: offer a report when the answer has data behind it (or show the files already attached)
@@ -224,12 +236,14 @@
     row.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 
-  // How long each kind of step stays "running" before it ticks off, plus a little jitter.
+  // How long each kind of step stays "running" before it ticks off. The answer is already there, so the
+  // whole replay is capped at STEPS_TOTAL_MS to avoid adding noticeable wait time.
   const STEP_MS = { plan: 500, data: 750, rule: 650, answer: 550 };
+  const STEPS_TOTAL_MS = 1500;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   /** Agent steps in the right-hand pane: each step runs (spinner + live label), then completes (tick + result). */
-  async function playSteps(steps, ms, question) {
+  async function playSteps(steps, ms, question, data = {}) {
     const pane = els.stepsPane;
     pane.innerHTML = "";
     if (question) pane.appendChild(el("div", "steps-q", question));
@@ -237,6 +251,8 @@
     const list = el("ol", "step-list");
     pane.append(meta, list);
 
+    const total = steps.reduce((t, s) => t + (STEP_MS[s.kind] || 600), 0);
+    const scale = Math.min(1, STEPS_TOTAL_MS / Math.max(total, 1));
     for (const s of steps) {
       const li = el("li", "step running");
       li.innerHTML = `<span class="step-icon" aria-hidden="true"></span><div class="step-text">
@@ -244,13 +260,17 @@
         <div class="step-src">${esc(s.source)}</div></div>`;
       list.appendChild(li);
       li.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      await sleep((STEP_MS[s.kind] || 600) + Math.random() * 350);
+      await sleep((STEP_MS[s.kind] || 600) * scale);
       li.classList.replace("running", "done");
       li.querySelector(".step-title").textContent = s.title;
       if (s.detail) li.querySelector(".step-text").appendChild(el("div", "step-detail", s.detail));
     }
-    meta.textContent =
-      `Done · ${steps.length} steps · ${ms < 1000 ? `${Math.max(1, Math.round(ms))} ms` : `${(ms / 1000).toFixed(1)} s`}`;
+    const took = ms < 1000 ? `${Math.max(1, Math.round(ms))} ms` : `${(ms / 1000).toFixed(1)} s`;
+    const by = data.answeredBy === "llm" ? "Answered by GPT-4o (SAP AI Core)"
+      : data.llmFallback ? "LLM unavailable - rule-based answer" : "Rule-based answer";
+    const asOf = data.dataAsOf ? ` · S43 data as of ${fmtTime(data.dataAsOf)}` : "";
+    meta.textContent = `Done · ${steps.length} steps · ${took}`;
+    pane.insertBefore(el("div", `steps-by${data.llmFallback ? " steps-by-warn" : ""}`, by + asOf), list);
   }
 
   const STATUS = {
@@ -295,6 +315,15 @@
   }
 
   // ------------------------------------------------------------------ markdown (subset used by the agent)
+  function stripFooter(text) {
+    return text.split("\n").filter((l) => !/^_(Data as of|Attached)/.test(l.trim())).join("\n").trim();
+  }
+
+  function fmtTime(iso) {
+    const d = new Date(iso);
+    return isNaN(d) ? iso : d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  }
+
   function splitSections(text) {
     const cleaned = text.split("\n")
       .filter((l) => !/^_(Data as of|Attached CSV)/.test(l.trim()))
@@ -325,9 +354,35 @@
         html += table(block);
         continue;
       }
-      if (/^\s*-\s+/.test(line)) {
+      const h = line.match(/^\s*(#{1,4})\s+(.*)$/);
+      if (h) { html += `<h4 class="md-h">${inline(h[2])}</h4>`; i++; continue; }
+      if (/^\s*\d+[.)]\s+/.test(line)) {
+        html += `<ol start="${parseInt(line.trim(), 10) || 1}">`;
+        while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) html += `<li>${inline(lines[i++].replace(/^\s*\d+[.)]\s+/, ""))}</li>`;
+        html += "</ol>";
+        continue;
+      }
+      if (/^\s*[-*]\s+/.test(line)) {
+        // bullets; lines indented deeper than the first bullet become a nested list under the previous item
+        const base = line.match(/^\s*/)[0].length;
         html += "<ul>";
-        while (i < lines.length && /^\s*-\s+/.test(lines[i])) html += `<li>${inline(lines[i++].replace(/^\s*-\s+/, ""))}</li>`;
+        let open = false, nested = false;
+        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+          const depth = lines[i].match(/^\s*/)[0].length;
+          const item = inline(lines[i++].replace(/^\s*[-*]\s+/, ""));
+          if (depth > base && open) {
+            if (!nested) { html += "<ul>"; nested = true; }
+            html += `<li>${item}</li>`;
+          } else {
+            if (nested) { html += "</ul>"; nested = false; }
+            if (open) html += "</li>";
+            html += `<li>${item}`;
+            open = true;
+          }
+          while (i < lines.length && !lines[i].trim() && /^\s+[-*]\s+/.test(lines[i + 1] || "")) i++; // blank line inside the list
+        }
+        if (nested) html += "</ul>";
+        if (open) html += "</li>";
         html += "</ul>";
         continue;
       }

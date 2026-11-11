@@ -31,11 +31,6 @@ def _bool_or_path(value: str) -> bool | str:
     return value  # path to a CA bundle (.pem) for the S43 certificate
 
 
-# Where backend data comes from:
-#   "odata" (default) - live S43 OData V2 service ZSB_SMC_MATERIAL_V2 (SMC_All_OData_URLs_Complete 3.xlsx)
-#   "file"            - offline JSON snapshot in DATA_DIR (used by the unit tests)
-DATA_SOURCE = os.getenv("DATA_SOURCE", "odata").strip().lower()
-
 # Live S43 OData service (client 100).
 SAP_ODATA_BASE_URL = os.getenv(
     "SAP_ODATA_BASE_URL", "https://192.168.8.69:44300/sap/opu/odata/sap/ZSB_SMC_MATERIAL_V2")
@@ -45,11 +40,16 @@ SAP_PASSWORD = os.getenv("SAP_PASSWORD", "")
 # true (default) | false (accept self-signed cert - dev only) | path to CA bundle
 SAP_VERIFY_SSL = _bool_or_path(os.getenv("SAP_VERIFY_SSL", "true"))
 SAP_TIMEOUT_SECONDS = float(os.getenv("SAP_TIMEOUT_SECONDS", "60"))
-# Re-read S43 every N minutes while the server runs (0 = load once at startup). Ignored for "file".
+# SAP BTP (Cloud Foundry): name of the destination pointing to S43. When set, the URL, credentials
+# and Cloud Connector routing come from the bound Destination + Connectivity services, and
+# SAP_ODATA_BASE_URL / SAP_USER / SAP_PASSWORD are ignored. Leave empty for local runs.
+SAP_DESTINATION_NAME = os.getenv("SAP_DESTINATION_NAME", "").strip()
+# OData service path appended to the destination URL (unless the destination URL already contains it).
+SAP_ODATA_SERVICE_PATH = os.getenv("SAP_ODATA_SERVICE_PATH", "/sap/opu/odata/sap/ZSB_SMC_MATERIAL_V2")
+
+# Re-read S43 every N minutes while the server runs (0 = load once at startup).
 DATA_REFRESH_MINUTES = float(os.getenv("DATA_REFRESH_MINUTES", "15"))
 
-# Folder holding the offline extracts (WorkOrderShortage / ProductionOrder / MaterialMaster / Inventory).
-DATA_DIR = Path(os.getenv("SAMPLE_DATA_DIR", PROJECT_ROOT / "Sample_data"))
 
 # Aging threshold in days. Default 14 (global KPI); changed only by an authorized administrator
 # through configuration, never by the end user in chat.
@@ -60,3 +60,19 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("
 
 PLANT = os.getenv("PLANT", "CN16")
 SITE_NAME = "Jabil Suzhou GP"
+
+# SAP AI Core (generative AI hub). When all of these are set, an LLM understands the question
+# (picks the business-rule tools and their parameters) and writes the answer from their results.
+# Numbers always come from S43 via the deterministic rules. If unset or AI Core fails, the
+# keyword router + answer templates are used instead.
+AICORE_AUTH_URL = os.getenv("AICORE_AUTH_URL", "").strip()
+AICORE_CLIENT_ID = os.getenv("AICORE_CLIENT_ID", "").strip()
+AICORE_CLIENT_SECRET = os.getenv("AICORE_CLIENT_SECRET", "").strip()
+AICORE_BASE_URL = os.getenv("AICORE_BASE_URL", "").strip()
+AICORE_RESOURCE_GROUP = os.getenv("AICORE_RESOURCE_GROUP", "default").strip()
+LLM_DEPLOYMENT_ID = os.getenv("LLM_DEPLOYMENT_ID", "").strip()
+LLM_ENABLED = os.getenv("LLM_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off") and all(
+    (AICORE_AUTH_URL, AICORE_CLIENT_ID, AICORE_CLIENT_SECRET, AICORE_BASE_URL, LLM_DEPLOYMENT_ID))
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
+# Previous question/answer pairs kept per conversation (A2A contextId) for follow-up questions.
+LLM_HISTORY_TURNS = int(os.getenv("LLM_HISTORY_TURNS", "6"))

@@ -12,6 +12,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from app.data.repository import DataRepository
+from app.llm.aicore import LLMError
 from app.planner import intents, rules
 from app.planner.service import PlannerService, Section
 
@@ -80,9 +81,11 @@ class AgentReply:
 class PlannerAgent:
     name = "planner"
 
-    def __init__(self, repo: DataRepository, aging_threshold_days: int):
+    def __init__(self, repo: DataRepository, aging_threshold_days: int, llm=None):
         self.repo = repo
         self.service = PlannerService(repo, aging_threshold_days)
+        # Optional LLMPlanner (GPT-4o on SAP AI Core); None -> keyword router + answer templates.
+        self.llm = llm
 
     def refresh_data(self) -> None:
         """Re-read the backend (live S43) and rebuild the service's derived lookups."""
@@ -90,17 +93,34 @@ class PlannerAgent:
         self.service = PlannerService(self.repo, self.service.aging_threshold)
 
     # ------------------------------------------------------------------ entry point
-    def handle(self, text: str, structured: dict | None = None) -> AgentReply:
+    def handle(self, text: str, structured: dict | None = None, context_id: str | None = None) -> AgentReply:
         structured = structured or {}
+        # Free-text questions go to the LLM; structured skill calls (e.g. from Joule) stay deterministic.
+        llm_failed = False
+        if self.llm is not None and (text or "").strip() and not structured.get("skill"):
+            try:
+                answer, sections, query, calls = self.llm.answer(text, context_id)
+                if structured:
+                    _merge_structured(query, structured, self.repo)
+                return self._reply(answer, sections, query, llm_calls=calls)
+            except LLMError:
+                log.exception("LLM unavailable - answering with the rule-based router")
+                llm_failed = True
+
         query = intents.parse(text or "", self.repo)
         _merge_structured(query, structured, self.repo)
         sections = self._route(query, structured.get("skill"))
-
-        provenance = self.repo.provenance()
         body = "\n\n---\n\n".join(f"### {s.title}\n{_summary_md(s)}{s.text}" for s in sections)
         if query.unknown_orders:
             body = (f"Work order(s) {', '.join(query.unknown_orders)} not found in the production order universe.\n\n"
                     + body)
+        reply = self._reply(body, sections, query)
+        reply.data["llmFallback"] = llm_failed
+        return reply
+
+    def _reply(self, body: str, sections: list[Section], query: intents.ParsedQuery,
+               llm_calls: list[dict] | None = None) -> AgentReply:
+        provenance = self.repo.provenance()
         footer = (f"\n\n_Data as of {provenance['dataAsOf']} - {provenance['dataSource']}. "
                   f"Aging threshold {self.service.aging_threshold} days._")
 
@@ -121,14 +141,17 @@ class PlannerAgent:
             "results": [{"skill": s.skill, "title": s.title, "resultType": s.result_type, "severity": s.severity,
                          "headline": s.headline, "actions": s.actions, "rowCount": len(s.rows), "data": s.data}
                         for s in sections],
-            "trace": self._trace(query, sections, provenance),
+            "trace": self._trace(query, sections, provenance, llm_calls),
+            "answeredBy": "llm" if llm_calls is not None else "rules",
             **provenance,
         }
-        log.info("planner skills=%s entities=%s", [s.skill for s in sections], query.as_dict())
+        log.info("planner answeredBy=%s skills=%s entities=%s", data["answeredBy"],
+                 [s.skill for s in sections], query.as_dict())
         return AgentReply(text=body + footer, data=data, files=files)
 
     # ------------------------------------------------------------------ agent steps
-    def _trace(self, q: intents.ParsedQuery, sections: list[Section], provenance: dict) -> list[dict]:
+    def _trace(self, q: intents.ParsedQuery, sections: list[Section], provenance: dict,
+               llm_calls: list[dict] | None = None) -> list[dict]:
         """What the agent did, in order: understand the question, read each data source, apply rules, answer."""
         asked = {"work_orders": "work order", "materials": "material", "storage_locations": "storage location",
                  "mrp_controllers": "planner", "order_types": "order type"}
@@ -139,20 +162,32 @@ class PlannerAgent:
                   "detail": "; ".join(filter(None, [("Topics: " + ", ".join(topics)) if topics else "",
                                                     ("Looking for " + ", ".join(found)) if found else ""]))
                   or "General question"}]
+        if llm_calls is not None:
+            steps[0].update(source=LLM_SOURCE, detail="; ".join(_describe_call(c) for c in llm_calls)
+                            or "No S43 lookup needed - replied directly or asked for clarification")
+            if q.unknown_orders:
+                steps[0]["detail"] += f" (not found in S43: {', '.join(q.unknown_orders)})"
+        # Work-order checks the LLM limited to some topics: only list the checks that actually ran.
+        wo_topics = {t for c in llm_calls or [] if c.get("tool") == "work_order_shortage"
+                     for t in (c.get("args") or {}).get("topics") or []}
+        skip = {title for topic, title in _WO_TOPIC_CHECKS.items() if wo_topics and topic not in wo_topics}
         read, checks = [], {}
         for s in sections:
             keys, rule_steps = SKILL_TRACE.get(s.skill, ([], []))
             read += [k for k in keys if k not in read]
             for title, active, detail in rule_steps:
+                if s.skill == "work_order_shortage" and title in skip:
+                    continue
                 checks.setdefault(title, (active, detail.replace("{T}", str(self.service.aging_threshold))))
         for k in read:
-            steps.append({"title": f"Read {SOURCES[k]} data", "active": f"Querying {SOURCES[k]} data",
-                          "source": "Backend data", "kind": "data",
+            steps.append({"title": f"Read {SOURCES[k]} data", "active": f"Reading {SOURCES[k]} data",
+                          "source": "SAP S43", "kind": "data",
                           "detail": self._scope(k, q, {s.skill for s in sections})})
         for title, (active, detail) in checks.items():
             steps.append({"title": title, "active": active, "source": "Business rules", "kind": "rule",
                           "detail": detail})
-        steps.append({"title": "Prepared the answer", "active": "Preparing the answer", "source": "Planner Agent",
+        steps.append({"title": "Prepared the answer", "active": "Preparing the answer",
+                      "source": LLM_SOURCE if llm_calls is not None else "Answer templates",
                       "kind": "answer", "detail": "Summarised the findings and recommended next actions"})
         return steps
 
@@ -263,6 +298,34 @@ class PlannerAgent:
         }[skill]()
 
 
+LLM_SOURCE = "LLM - GPT-4o on SAP AI Core"
+_WO_TOPIC_CHECKS = {"shortage": "Checked material shortage", "aged": "Checked stock age",
+                    "over_issued": "Checked over-issue"}
+_CALL_LABELS = {
+    "work_order_shortage": "Shortage check", "production_order": "Production order status",
+    "shortage_overview": "Shortage overview", "aged_materials": "Aged stock", "over_issued": "Over-issue check",
+    "material_status": "Line-side control status", "material_report": "Material report",
+    "machine_head_review": "Machine-head review", "attach_report": "Attach file",
+}
+_ARG_LABELS = {
+    "work_order": "work order", "work_orders": "work orders", "material": "material", "materials": "materials",
+    "storage_locations": "storage location", "mrp_controllers": "MRP controller", "order_types": "order type",
+    "topics": "topics", "status": "status", "format": "format",
+}
+
+
+def _describe_call(call: dict) -> str:
+    """'Shortage check (work order 121060001)' - what the LLM decided to look up."""
+    args = []
+    for key, value in (call.get("args") or {}).items():
+        if value in (None, "", []):
+            continue
+        value = ", ".join(map(str, value)) if isinstance(value, list) else str(value)
+        args.append(f"{_ARG_LABELS.get(key, key)} {value.replace('_', ' ')}")
+    label = _CALL_LABELS.get(call.get("tool"), str(call.get("tool")).replace("_", " "))
+    return f"{label} ({'; '.join(args)})" if args else label
+
+
 def _merge_structured(q: intents.ParsedQuery, s: dict, repo: DataRepository) -> None:
     """Fold DataPart parameters (e.g. sent by Joule after its own NLU) into the parsed query."""
     def as_list(v):
@@ -285,13 +348,10 @@ def _merge_structured(q: intents.ParsedQuery, s: dict, repo: DataRepository) -> 
 
 
 def _summary_md(s: Section) -> str:
-    """Plain-language answer + next steps, placed before the detail tables."""
+    """Plain-language answer, placed before the detail tables."""
     if not s.headline:
         return ""
-    out = f"**Answer:** {s.headline}\n\n"
-    if s.actions:
-        out += "**What to do next:**\n" + "\n".join(f"- {a}" for a in s.actions) + "\n\n"
-    return out + "**Details:**\n\n"
+    return f"**Answer:** {s.headline}\n\n**Details:**\n\n"
 
 
 def _status_filter(text: str) -> str | None:
