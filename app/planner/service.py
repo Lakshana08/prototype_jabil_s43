@@ -31,6 +31,8 @@ class Section:
     actions: list[str] = field(default_factory=list)
     # ok | warning | critical | info - drives how prominently the answer is flagged
     severity: str = "info"
+    # Storage-location code -> name, from the data this answer was built on (warehouse vs. line-side).
+    location_names: dict = field(default_factory=dict)
 
 
 class PlannerService:
@@ -44,10 +46,9 @@ class PlannerService:
         """Σ ControlledRemainingIssueQty per (SLoc, Material) over controlled components
         (ExcludeReason empty) - the lookup table behind spec §6.1/§6.2."""
         req: dict[tuple[str, str], float] = defaultdict(float)
-        for order in self.repo.shortage_by_order:
-            for c in self.repo.components(order):
-                if not c.get("ExcludeReason") and c.get("StorageLocation"):
-                    req[(c["StorageLocation"], c["Material"].upper())] += c.get("ControlledRemainingIssueQty") or 0
+        for c in self.repo.all_components():
+            if not c.get("ExcludeReason") and c.get("StorageLocation"):
+                req[(c["StorageLocation"], c["Material"].upper())] += c.get("ControlledRemainingIssueQty") or 0
         return dict(req)
 
     def _aged_stock(self, material: str) -> list[dict]:
@@ -436,7 +437,8 @@ class PlannerService:
                     "OverIssuedQty": qty, "Classification": rules.classify_over_issue(c),
                     "OrderExcludeReason": c.get("ExcludeReason") or "",
                 })
-        rows.sort(key=lambda r: (r["WorkOrder"], r["Component"]))
+        # Lines that need a decision (plain over-issue) first, so they are never pushed to a later page.
+        rows.sort(key=lambda r: (r["Classification"].startswith("Over-control"), r["WorkOrder"], r["Component"]))
         reasonable = sum(1 for r in rows if r["Classification"].startswith("Over-control"))
         filt = _filter_text(orders=orders, mrp=mrp, order_types=order_types, materials=materials)
         lines = [f"**{len(rows)} over-issued WIP component line(s)**{filt} - "
@@ -784,15 +786,14 @@ class PlannerService:
 
     # ================================================================ misc
     def _order_not_found(self, skill: str, order: str) -> Section:
+        rng = self.repo.order_range
+        span = f" - work orders available right now run from {rng[0]} to {rng[1]}" if rng else ""
         return Section(skill, f"Work order {order}",
-                       f"Work order **{order}** was not found in the {self._plant_text()} production order universe "
-                       f"({len(self.repo.production_order_by_order)} orders loaded). Please check the number.",
+                       f"Work order **{order}** was not found in the {self._plant_text()} production order universe. "
+                       "Please check the number.",
                        data={"workOrder": order}, result_type="not_found",
-                       headline=(f"I could not find work order {order}. Please check the number - work orders "
-                                 f"available right now run from {min(self.repo.production_order_by_order)} to "
-                                 f"{max(self.repo.production_order_by_order)}."),
-                       actions=["Check the number - valid orders in S43 run from "
-                                f"{min(self.repo.production_order_by_order)} to {max(self.repo.production_order_by_order)}."],
+                       headline=f"I could not find work order {order}. Please check the number{span}.",
+                       actions=["Check the number" + (f" - valid orders in S43 run from {rng[0]} to {rng[1]}" if rng else "") + "."],
                        severity="info")
 
     def _plant_text(self) -> str:

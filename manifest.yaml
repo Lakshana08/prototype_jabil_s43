@@ -19,16 +19,15 @@ applications:
       - smart-material-ai-destination    # Destination service - used to read the existing destination
       - smart-material-ai-connectivity   # Connectivity service - proxy to the SAP Cloud Connector
     env:
-      SAP_DESTINATION_NAME: S43   # must match the existing destination name exactly (case-sensitive)
+      SAP_DESTINATION_NAME: S43   
       SAP_ODATA_SERVICE_PATH: /sap/opu/odata/sap/ZSB_SMC_MATERIAL_V2
       SAP_CLIENT: "100"     # used only if the destination has no sap-client property
       SAP_TIMEOUT_SECONDS: "60"
-      DATA_REFRESH_MINUTES: "15"
       AGING_THRESHOLD_DAYS: "14"
       PLANT: CN16
-      # LLM (SAP AI Core) - secrets are NOT kept here; set once, then restage:
-      #   cf set-env smart-material-chat-s43 AICORE_CLIENT_ID '<id>'
-      #   cf set-env smart-material-chat-s43 AICORE_CLIENT_SECRET '<secret>'
+      # LLM (SAP AI Core)
+      AICORE_CLIENT_ID: 'sb-42a29a03-b2f4-47de-9a41-e0936be9aaf5!b256749|aicore!b164'
+      AICORE_CLIENT_SECRET: 'b5e6caee-15aa-493a-a6ac-1fef0ab6e9fe$Satg7UGYPLsz5YYeXefHpbwTfEqqCkQEbasMDPGHAgU='
       AICORE_AUTH_URL: https://gen-ai.authentication.us10.hana.ondemand.com/oauth/token
       AICORE_BASE_URL: https://api.ai.prod.us-east-1.aws.ml.hana.ondemand.com/v2
       AICORE_RESOURCE_GROUP: default

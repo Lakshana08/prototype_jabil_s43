@@ -161,6 +161,16 @@
     return foot;
   }
 
+  /** "Show next 20": sends the server-built follow-up text as a normal message; removes itself so it can't be double-clicked. */
+  function nextPageButton(prompt) {
+    const foot = el("div", "card-foot");
+    const btn = el("button", "btn-report", "Show next 20");
+    btn.type = "button";
+    btn.addEventListener("click", () => { foot.remove(); ask(prompt); });
+    foot.appendChild(btn);
+    return foot;
+  }
+
   // ------------------------------------------------------------------ rendering
   function addUser(text) {
     const div = el("div", "msg msg-user");
@@ -233,6 +243,7 @@
     } else if (question && results.some((r) => r.rowCount > 0)) {
       card.appendChild(reportPrompt(question));
     }
+    if (data.next_page_prompt) card.appendChild(nextPageButton(data.next_page_prompt));
     row.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 
