@@ -61,16 +61,29 @@ class ODataClient:
         self._types: dict[str, dict[str, str]] | None = None
 
     # ------------------------------------------------------------------ public
-    def url(self, entity_set: str, expand: list[str] | None = None) -> str:
+    def url(self, entity_set: str, expand: list[str] | None = None, filter: str | None = None,
+            top: int | None = None, orderby: str | None = None, select: list[str] | None = None) -> str:
         params = {"sap-client": self.client, "$format": "json", "$inlinecount": "allpages"}
         if expand:
             params["$expand"] = ",".join(expand)
-        return f"{self.base_url}/{entity_set}?{urllib.parse.urlencode(params, safe='$,_')}"
+        if filter:
+            params["$filter"] = filter
+        if top is not None:
+            params["$top"] = str(top)
+        if orderby:
+            params["$orderby"] = orderby
+        if select:
+            params["$select"] = ",".join(select)
+        return f"{self.base_url}/{entity_set}?{urllib.parse.urlencode(params, safe='$,_', quote_via=urllib.parse.quote)}"
 
-    def read_all(self, entity_set: str, expand: list[str] | None = None) -> list[dict]:
-        """GET every record of an entity set (following ``__next``), normalised."""
+    def read(self, entity_set: str, expand: list[str] | None = None, filter: str | None = None,
+             top: int | None = None, orderby: str | None = None, select: list[str] | None = None) -> list[dict]:
+        """GET the records of an entity set that match ``filter`` (server-side), normalised.
+
+        ``top`` caps the number of records; without it every matching record is read (following ``__next``).
+        """
         types = self._property_types()
-        url: str | None = self.url(entity_set, expand)
+        url: str | None = self.url(entity_set, expand, filter, top, orderby, select)
         results: list[dict] = []
         while url:
             payload = self._get_json(url)
@@ -81,8 +94,12 @@ class ODataClient:
                 raise ODataError(f"{entity_set}: not an OData V2 'd.results' payload ({exc})") from exc
             results.extend(_normalise(rec, types) for rec in page)
             nxt = envelope.get("__next") if isinstance(envelope, dict) else None
-            url = self._absolute(nxt) if nxt else None
-        return results
+            url = self._absolute(nxt) if nxt and (top is None or len(results) < top) else None
+        return results[:top] if top is not None else results
+
+    def read_all(self, entity_set: str, expand: list[str] | None = None) -> list[dict]:
+        """GET every record of an entity set (following ``__next``), normalised."""
+        return self.read(entity_set, expand)
 
     # ------------------------------------------------------------------ internals
     def _get(self, url: str, accept: str | None = None) -> bytes:
@@ -189,3 +206,30 @@ def _convert(value, edm_type: str | None):
 
 def _redact(url: str) -> str:
     return url.split("?", 1)[0]
+
+
+# ---------------------------------------------------------------------- $filter helpers
+_SAFE_VALUE = re.compile(r"^[\w .\-/+:]{1,60}$")
+
+
+def literal(value) -> str:
+    """OData string literal for a user-supplied key. Rejects anything that is not a plain SAP key."""
+    text = str(value).strip()
+    if not _SAFE_VALUE.match(text):
+        raise ODataError(f"Not a valid key: {text[:40]!r}")
+    return "'" + text.replace("'", "''") + "'"
+
+
+def eq(field: str, value) -> str:
+    return f"{field} eq {literal(value)}"
+
+
+def any_of(field: str, values) -> str:
+    """``(F eq 'a' or F eq 'b')`` - the V2 way to say ``F in (...)``."""
+    parts = [eq(field, v) for v in values]
+    return parts[0] if len(parts) == 1 else "(" + " or ".join(parts) + ")"
+
+
+def all_of(*clauses: str | None) -> str | None:
+    clauses = [c for c in clauses if c]
+    return " and ".join(clauses) or None

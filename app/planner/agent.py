@@ -11,10 +11,11 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from app.data.repository import DataRepository
+from app.data.repository import LiveSource, begin_request
 from app.llm.aicore import LLMError
 from app.planner import intents, rules
-from app.planner.service import PlannerService, Section
+from app.planner.live import LiveService
+from app.planner.service import Section
 
 log = logging.getLogger(__name__)
 
@@ -81,34 +82,31 @@ class AgentReply:
 class PlannerAgent:
     name = "planner"
 
-    def __init__(self, repo: DataRepository, aging_threshold_days: int, llm=None):
-        self.repo = repo
-        self.service = PlannerService(repo, aging_threshold_days)
+    def __init__(self, source: LiveSource, aging_threshold_days: int, llm=None):
+        # Live S43 access: every question reads only the records it needs, nothing is kept in memory.
+        self.source = source
+        self.service = LiveService(source, aging_threshold_days)
         # Optional LLMPlanner (GPT-4o on SAP AI Core); None -> keyword router + answer templates.
         self.llm = llm
-
-    def refresh_data(self) -> None:
-        """Re-read the backend (live S43) and rebuild the service's derived lookups."""
-        self.repo.reload()
-        self.service = PlannerService(self.repo, self.service.aging_threshold)
 
     # ------------------------------------------------------------------ entry point
     def handle(self, text: str, structured: dict | None = None, context_id: str | None = None) -> AgentReply:
         structured = structured or {}
+        begin_request()  # start the list of S43 reads that this answer's "data as of" line reports
         # Free-text questions go to the LLM; structured skill calls (e.g. from Joule) stay deterministic.
         llm_failed = False
         if self.llm is not None and (text or "").strip() and not structured.get("skill"):
             try:
                 answer, sections, query, calls = self.llm.answer(text, context_id)
                 if structured:
-                    _merge_structured(query, structured, self.repo)
+                    _merge_structured(query, structured, self.source)
                 return self._reply(answer, sections, query, llm_calls=calls)
             except LLMError:
                 log.exception("LLM unavailable - answering with the rule-based router")
                 llm_failed = True
 
-        query = intents.parse(text or "", self.repo)
-        _merge_structured(query, structured, self.repo)
+        query = intents.parse(text or "", self.source)
+        _merge_structured(query, structured, self.source)
         sections = self._route(query, structured.get("skill"))
         body = "\n\n---\n\n".join(f"### {s.title}\n{_summary_md(s)}{s.text}" for s in sections)
         if query.unknown_orders:
@@ -120,9 +118,15 @@ class PlannerAgent:
 
     def _reply(self, body: str, sections: list[Section], query: intents.ParsedQuery,
                llm_calls: list[dict] | None = None) -> AgentReply:
-        provenance = self.repo.provenance()
+        provenance = self.source.provenance()
         footer = (f"\n\n_Data as of {provenance['dataAsOf']} - {provenance['dataSource']}. "
                   f"Aging threshold {self.service.aging_threshold} days._")
+
+        page = next((c["page"] for c in llm_calls or [] if c.get("page", {}).get("has_more")), None) \
+            or next((c["page"] for c in llm_calls or [] if c.get("page", {}).get("skip")), None)
+        if page:
+            last = page["skip"] + page["returned"]
+            footer += f"\n\n_Showing rows {page['skip'] + 1}-{last} of {page['count']:,}._"
 
         files = []
         with_rows = [s for s in sections if s.rows]
@@ -141,6 +145,8 @@ class PlannerAgent:
             "results": [{"skill": s.skill, "title": s.title, "resultType": s.result_type, "severity": s.severity,
                          "headline": s.headline, "actions": s.actions, "rowCount": len(s.rows), "data": s.data}
                         for s in sections],
+            # Flat, top level: the UI's "Show next 20" button only needs this one value (null on the last page).
+            "next_page_prompt": page.get("next_page_prompt") if page else None,
             "trace": self._trace(query, sections, provenance, llm_calls),
             "answeredBy": "llm" if llm_calls is not None else "rules",
             **provenance,
@@ -318,7 +324,7 @@ def _describe_call(call: dict) -> str:
     """'Shortage check (work order 121060001)' - what the LLM decided to look up."""
     args = []
     for key, value in (call.get("args") or {}).items():
-        if value in (None, "", []):
+        if key == "skip" or value in (None, "", []):
             continue
         value = ", ".join(map(str, value)) if isinstance(value, list) else str(value)
         args.append(f"{_ARG_LABELS.get(key, key)} {value.replace('_', ' ')}")
@@ -326,7 +332,7 @@ def _describe_call(call: dict) -> str:
     return f"{label} ({'; '.join(args)})" if args else label
 
 
-def _merge_structured(q: intents.ParsedQuery, s: dict, repo: DataRepository) -> None:
+def _merge_structured(q: intents.ParsedQuery, s: dict, source: LiveSource) -> None:
     """Fold DataPart parameters (e.g. sent by Joule after its own NLU) into the parsed query."""
     def as_list(v):
         return [v] if isinstance(v, str) else list(v or [])
@@ -335,7 +341,7 @@ def _merge_structured(q: intents.ParsedQuery, s: dict, repo: DataRepository) -> 
         wo = str(wo)
         if wo in q.work_orders or wo in q.unknown_orders:
             continue
-        (q.work_orders if wo in repo.production_order_by_order else q.unknown_orders).append(wo)
+        (q.work_orders if source.find_order(wo) else q.unknown_orders).append(wo)
     q.materials += [m.upper() for m in as_list(s.get("material")) if m.upper() not in q.materials]
     q.storage_locations += [x.upper() for x in as_list(s.get("storageLocation")) if x.upper() not in q.storage_locations]
     q.mrp_controllers += [x for x in as_list(s.get("mrpController")) if x not in q.mrp_controllers]

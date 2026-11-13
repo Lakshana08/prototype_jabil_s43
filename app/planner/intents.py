@@ -1,14 +1,14 @@
 """Deterministic intent + entity extraction for planner questions (English / Mandarin).
 
-Entities are matched against the backend's known keys (orders, materials, SLocs, MRP
-controllers), so an extracted value is always a real key, never a guess.
+Candidate keys in the text are checked against S43 (one small look-up each), so an extracted
+value is always a real key, never a guess.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 
-from app.data.repository import DataRepository
+from app.data.repository import LiveSource
 
 INTENT_KEYWORDS: dict[str, list[str]] = {
     "shortage": ["short", "shortage", "missing", "lack"],
@@ -28,6 +28,7 @@ EXPORT_KEYWORDS = ["csv", "export", "download", "excel", "xlsx", "spreadsheet"]
 EXCEL_KEYWORDS = ["excel", "xlsx", "spreadsheet"]
 
 ORDER_RE = re.compile(r"(?<!\d)(\d{9})(?!\d)")
+_NOT_KEYS = {"csv", "wo", "sku", "xlsx", "ok", "mrp", "bom", "gr", "gi", "aged", "all"}
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9]|[A-Za-z0-9]")
 
 
@@ -47,7 +48,10 @@ class ParsedQuery:
         return {k: v for k, v in vars(self).items() if k != "text" and v}
 
 
-def parse(text: str, repo: DataRepository) -> ParsedQuery:
+MAX_KEY_CANDIDATES = 8  # each candidate costs up to a few S43 look-ups
+
+
+def parse(text: str, source: LiveSource) -> ParsedQuery:
     low = text.lower()
     q = ParsedQuery(text=text)
     q.intents = [name for name, words in INTENT_KEYWORDS.items() if any(w in low for w in words)]
@@ -55,24 +59,28 @@ def parse(text: str, repo: DataRepository) -> ParsedQuery:
         q.export_format = "xlsx" if any(w in low for w in EXCEL_KEYWORDS) else "csv"
 
     for num in ORDER_RE.findall(text):
-        target = q.work_orders if num in repo.production_order_by_order else q.unknown_orders
+        target = q.work_orders if source.find_order(num) else q.unknown_orders
         if num not in target:
             target.append(num)
 
-    known_mats = repo.known_materials
-    slocs = repo.known_storage_locations
-    mrps = repo.known_mrp_controllers
-    types = repo.known_order_types
+    # Only tokens that look like SAP keys are looked up: they contain a digit (material, location)
+    # or are an upper-case code (MRP controller, order type). Ordinary words are never sent to S43.
+    candidates = []
     for tok in TOKEN_RE.findall(text):
+        if ORDER_RE.fullmatch(tok) or tok.lower() in _NOT_KEYS or tok in candidates:
+            continue
+        if any(ch.isdigit() for ch in tok) or (tok.isupper() and 2 <= len(tok) <= 6):
+            candidates.append(tok)
+    for tok in candidates[:MAX_KEY_CANDIDATES]:
         up = tok.upper()
-        if up in known_mats and up not in q.materials:
-            q.materials.append(up)
-        elif up in slocs and up not in q.storage_locations:
-            q.storage_locations.append(up)
-        elif tok in mrps and tok not in q.mrp_controllers:  # case-sensitive: avoid matching ordinary words
-            q.mrp_controllers.append(tok)
-        elif up in types and up not in q.order_types:
-            q.order_types.append(up)
+        if (mat := source.find_material(tok)) and mat not in q.materials:
+            q.materials.append(mat)
+        elif (sl := source.find_storage_location(tok)) and sl not in q.storage_locations:
+            q.storage_locations.append(sl)
+        elif tok.isupper() and (mrp := source.find_mrp_controller(tok)) and mrp not in q.mrp_controllers:
+            q.mrp_controllers.append(mrp)  # case-sensitive: avoid matching ordinary words
+        elif tok.isupper() and (ot := source.find_order_type(up)) and ot not in q.order_types:
+            q.order_types.append(ot)
 
     # "machine-head" also contains no other keyword; "over-control" must not double as over-issued
     if "material_status" in q.intents and "over_issued" in q.intents and not _has_any(low, ["over-issue", "over issue", "overissue", "z67", "z68"]):

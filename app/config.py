@@ -47,8 +47,6 @@ SAP_DESTINATION_NAME = os.getenv("SAP_DESTINATION_NAME", "").strip()
 # OData service path appended to the destination URL (unless the destination URL already contains it).
 SAP_ODATA_SERVICE_PATH = os.getenv("SAP_ODATA_SERVICE_PATH", "/sap/opu/odata/sap/ZSB_SMC_MATERIAL_V2")
 
-# Re-read S43 every N minutes while the server runs (0 = load once at startup).
-DATA_REFRESH_MINUTES = float(os.getenv("DATA_REFRESH_MINUTES", "15"))
 
 
 # Aging threshold in days. Default 14 (global KPI); changed only by an authorized administrator
