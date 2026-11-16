@@ -29,6 +29,7 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
     "suffix_s": ["-s material", "suffix", "ending in -s", "ends with -s"],
     "user_status": ["user status", "coois", "nmvt", "excluded order"],
     "issuance_14c": ["14c"],
+    "order_master": ["pp134", "pp-134", "pp 134", "order master"],
     "wo_remaining": ["remaining to issue", "remaining qty", "remaining quantity", "left to issue"],
     "help": ["help", "what can you do", "capabilit"],
 }

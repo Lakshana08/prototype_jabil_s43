@@ -74,3 +74,6 @@ class LiveService:
 
     def order_user_status(self, orders=(), excluded_only: bool = False) -> Section:
         return self.reports.order_user_status(orders, excluded_only)
+
+    def order_master(self, orders=(), materials=(), slocs=(), mrp=(), order_types=()) -> Section:
+        return self.reports.order_master(orders, materials, slocs, mrp, order_types)

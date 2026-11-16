@@ -82,7 +82,10 @@ ISSUANCE_14C = S4Api("MOD14C_Data", required_fields=("OrderNumber", "Component",
 # IssuableQty = NeedQty - StockQty.
 ISSUANCE_14C_SUMMARY = S4Api("MOD14C_Sheet1", required_fields=("RowLabel",))
 
-# PP-1341_1.xlsx has no OData service.
+# PP-1341_1.xlsx - PP134 order master (order, type, issuance location, material, MRP controller, quantities,
+# dates, work center). Flat rows, one per order. Property names are NOT confirmed against the live
+# $metadata yet, so nothing is required here and ``ReportService.order_master`` maps the fields tolerantly.
+ORDER_MASTER = S4Api("PP134_OrderMaster")
 
 # Source name used by the repository and the planner skills -> API.
 BY_NAME: dict[str, S4Api] = {
@@ -100,4 +103,5 @@ BY_NAME: dict[str, S4Api] = {
     "order_user_status": ORDER_USER_STATUS,
     "issuance_14c": ISSUANCE_14C,
     "issuance_14c_summary": ISSUANCE_14C_SUMMARY,
+    "order_master": ORDER_MASTER,
 }
