@@ -101,6 +101,11 @@ def planner_card() -> dict:
             {"id": "issuance_summary_14c", "name": "14C need vs. stock",
              "description": "PP-GP-014C-NSU summary: need, stock and issuable per storage location and material.",
              "tags": ["14C", "issuable"], "examples": ["14C summary for A201"]},
+            {"id": "order_master", "name": "PP134 order master",
+             "description": "PP-1341_1 order master: order type, issuance location, material, MRP controller, "
+                            "order/yield/scrap quantity, dates and work center. "
+                            "Params: workOrder, material, storageLocation, mrpController, orderType.",
+             "tags": ["PP134", "order master"], "examples": ["Show the PP134 order master for MRP controller ZDD"]},
             {"id": "order_user_status", "name": "COOIS user status",
              "description": "User status per work order (NMVT = excluded from the material checks).",
              "tags": ["COOIS", "NMVT"], "examples": ["Which orders have user status NMVT?"]},

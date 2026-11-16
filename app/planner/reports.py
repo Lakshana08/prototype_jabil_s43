@@ -9,6 +9,7 @@ These entity sets mirror the SME's Excel files one to one, as flat rows:
 * ``COOIS_OrderStatus``      COOIS - user status of work orders (NMVT = excluded)
 * ``MOD14C_Data``            PP-GP-014C-NSU - component issuance per work order (SME formulas)
 * ``MOD14C_Sheet1``          PP-GP-014C-NSU - need / stock / issuable per storage location + material
+* ``PP134_OrderMaster``      PP-1341_1 - order master: type, issuance location, material, MRP controller, qty, dates
 
 The quantities are calculated in S43 (CDS views); these skills only filter, total and explain them.
 Every call reads only the rows the question needs (server-side ``$filter``); nothing is cached.
@@ -18,7 +19,7 @@ from __future__ import annotations
 from collections import Counter
 
 from app.data.odata import ODataError, literal
-from app.data.repository import LiveSource
+from app.data.repository import DataLoadError, LiveSource
 from app.planner.rules import fmt
 from app.planner.service import Section, _d, _md_table, _plural
 
@@ -280,6 +281,64 @@ class ReportService:
                              "notInCOOIS": missing},
                        rows=rows, headline=headline, severity="info" if rows else "ok")
 
+    # ================================================================ PP134 order master
+    # output field -> candidate OData property names (matched ignoring case, spaces and punctuation).
+    _OM_FIELDS = {
+        "WorkOrder": ("ManufacturingOrder", "OrderNumber", "Order"),
+        "OrderType": ("ManufacturingOrderType", "OrderType", "Type"),
+        "EnteredBy": ("EnteredBy", "CreatedByUser", "CreatedBy"),
+        "CreatedOn": ("CreatedOn", "CreationDate", "ManufacturingOrderCreationDate"),
+        "StorageLocation": ("IssuanceLocation", "StorageLocation", "IssuingStorageLocation"),
+        "Material": ("Material", "Product"),
+        "Description": ("MaterialDescription", "ProductDescription"),
+        "ExtMatGroup": ("ExtMatGrp", "ExternalMaterialGroup"),
+        "MRPController": ("MRPController", "MRPResponsible"),
+        "OrderQty": ("OrderQty", "TotalQuantity", "OrderQuantity"),
+        "YieldQty": ("YieldQty", "YieldQuantity", "ConfirmedYieldQuantity"),
+        "ScrapQty": ("ScrapQty", "ScrapQuantity", "ConfirmedScrapQuantity"),
+        "Unit": ("BUn", "BaseUnit", "ProductionUnit"),
+        "OrderStart": ("OrdStart", "OrderStart", "MfgOrderScheduledStartDate", "ScheduledStartDate"),
+        "OrderFinish": ("OrdFinish", "OrderFinish", "MfgOrderScheduledEndDate", "ScheduledEndDate"),
+        "ReleasedOn": ("ReleaseOn", "ReleasedOn", "MfgOrderActualReleaseDate"),
+        "ActualStart": ("ActualStart", "MfgOrderActualStartDate"),
+        "MaterialGroup": ("MaterialGroup",),
+        "ProfitCenter": ("ProfitCtr", "ProfitCenter"),
+        "WorkCenter": ("WorkCenter",),
+    }
+
+    def order_master(self, orders=(), materials=(), slocs=(), mrp=(), order_types=()) -> Section:
+        recs = self.source.report_rows("order_master")
+        if not recs:
+            return Section("order_master", "PP134 order master", "No orders found.", data={"positions": 0},
+                           rows=[], headline="PP134_OrderMaster returned no orders.", severity="ok")
+        rows = [_om_row(r, self._OM_FIELDS) for r in recs]
+        if not any(r["WorkOrder"] for r in rows):
+            raise DataLoadError("PP134_OrderMaster: no order-number property found; fields returned: "
+                                + ", ".join(sorted(recs[0])))
+        # Filtered here (the OData property names are not confirmed): the set is ~2000 rows by design.
+        want = {"WorkOrder": set(orders), "Material": set(materials), "StorageLocation": set(slocs),
+                "MRPController": set(mrp), "OrderType": set(order_types)}
+        rows = [r for r in rows if all(not v or str(r[k] or "").upper() in v for k, v in want.items())]
+        rows.sort(key=lambda r: (r["OrderStart"] or "", r["WorkOrder"] or ""))
+        total_qty = sum(r["OrderQty"] or 0 for r in rows)
+        by_type = Counter(r["OrderType"] or "-" for r in rows)
+        scope = _scope(orders=orders, materials=materials, slocs=slocs, mrp=mrp, order_types=order_types)
+        if rows:
+            split = ", ".join(f"{n}x {t}" for t, n in by_type.most_common(5))
+            headline = (f"{_plural(len(rows), 'order')}{scope} in the PP134 order master ({split}); "
+                        f"total order quantity {fmt(total_qty)}.")
+        else:
+            headline = f"No orders{scope} in the PP134 order master."
+        lines = [f"**{len(rows)} order(s)**{scope} - PP134 order master", ""]
+        lines += _md_table(["Order", "Type", "SLoc", "Material", "Description", "MRP", "Order qty", "Start", "Finish"],
+                           [[r["WorkOrder"], r["OrderType"], r["StorageLocation"], r["Material"], r["Description"],
+                             r["MRPController"], fmt(r["OrderQty"]), r["OrderStart"], r["OrderFinish"]] for r in rows])
+        return Section("order_master", "PP134 order master", "\n".join(lines),
+                       data={"filters": _filters(orders=orders, materials=materials, slocs=slocs, mrp=mrp,
+                                                 order_types=order_types),
+                             "orders": len(rows), "totalOrderQty": total_qty, "byType": dict(by_type)},
+                       rows=rows, headline=headline, severity="info" if rows else "ok")
+
 
 # ==================================================================== helpers
 def _label_filter(slocs, materials) -> str | None:
@@ -318,3 +377,17 @@ def _scope(**kw) -> str:
         prep = "in" if key == "slocs" else "with" if key == "statuses" else "for"
         parts.append(f"{prep} {word} {', '.join(values[:5])}{' ...' if len(values) > 5 else ''}")
     return (" " + " ".join(parts)) if parts else ""
+
+
+def _norm(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _om_row(rec: dict, fields: dict) -> dict:
+    """One PP134_OrderMaster record -> the output row; property names are matched ignoring case/punctuation."""
+    flat = {_norm(k): v for k, v in rec.items() if not k.startswith("_")}
+    out = {}
+    for name, candidates in fields.items():
+        value = next((flat[_norm(c)] for c in candidates if _norm(c) in flat), None)
+        out[name] = _d(str(value)) if value and name in ("CreatedOn", "OrderStart", "OrderFinish", "ReleasedOn", "ActualStart") else value
+    return out

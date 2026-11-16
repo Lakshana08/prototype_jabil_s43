@@ -125,6 +125,13 @@ TOOLS = [
           "COOIS user status of work orders, e.g. NMVT (no material movement) - such orders are excluded "
           "from the material checks. Use for 'user status', 'COOIS', 'NMVT' or 'which orders are excluded'.",
           {"work_orders": ANY_WO, "excluded_only": {"type": "boolean", "description": "Only excluded orders"}}),
+    _tool("order_master",
+          "PP134 order master (PP-1341_1): one row per order with type, issuance location, material, MRP "
+          "controller, order/yield/scrap quantity, start/finish/release dates and work center. Use for "
+          "'PP134', 'order master' or questions on order dates / quantities / work center.",
+          {"work_orders": ANY_WO, "materials": _arr("Material numbers"),
+           "storage_locations": _arr("Issuance locations"), "mrp_controllers": _arr("MRP controller codes"),
+           "order_types": _arr("Order types")}),
     _tool("attach_report",
           "Attach the detailed rows of the data fetched IN THIS TURN as a downloadable file. Always call the "
           "data tool(s) first in the same turn - also for a follow-up like 'give me that as Excel'. "
@@ -202,7 +209,7 @@ Meaning of the result fields:
   correctly where stock is; never call a line-side location "the warehouse".
 - overIssuedQty / z67z68Adjustment: issued beyond requirement and the adjustment postings for it.
 - Report tools (stock_list, issuable_stock, wo_component_remaining, component_issuance_14c,
-  issuance_summary_14c, order_user_status) show the SME's Excel reports as calculated in S43. Their work
+  issuance_summary_14c, order_user_status, order_master) show the SME's Excel reports as calculated in S43. Their work
   orders are a different, larger set than the production orders: never call an order "not found" because
   work_order_shortage did not know it - try the report tool. StockQty = stock on hand, StillToIssue =
   controlled quantity still to issue, AvailableToIssue = stock minus still-to-issue (negative = deficit).
@@ -375,6 +382,8 @@ class LLMPlanner:
             return svc.component_issuance_14c(wos, comps or mats, slocs, mrp, types)
         if name == "issuance_summary_14c":
             return svc.issuance_summary_14c(mats, slocs)
+        if name == "order_master":
+            return svc.order_master(wos, mats, slocs, mrp, types)
         return svc.order_user_status(wos, bool(args.get("excluded_only")))
 
     # ------------------------------------------------------------------ memory
@@ -418,7 +427,7 @@ def _compact(s: Section, location_names: dict[str, str] | None = None, skip: int
 
 
 REPORT_TOOLS = {"stock_list", "issuable_stock", "wo_component_remaining", "component_issuance_14c",
-                "issuance_summary_14c", "order_user_status"}
+                "issuance_summary_14c", "order_user_status", "order_master"}
 
 _PAGE_COLUMNS = {  # tool -> [(header, row key, unit key or None)]
     "over_issued": [("Work order", "WorkOrder", None), ("Component", "Component", None),
@@ -455,6 +464,9 @@ _PAGE_COLUMNS = {  # tool -> [(header, row key, unit key or None)]
                                ("Remaining", "RemainingQty", "Unit")],
     "issuance_summary_14c": [("Location", "StorageLocation", None), ("Material", "Material", None),
                              ("Need", "NeedQty", None), ("Stock", "StockQty", None), ("Issuable", "IssuableQty", None)],
+    "order_master": [("Order", "WorkOrder", None), ("Type", "OrderType", None), ("Location", "StorageLocation", None),
+                     ("Material", "Material", None), ("MRP", "MRPController", None), ("Order qty", "OrderQty", "Unit"),
+                     ("Start", "OrderStart", None), ("Finish", "OrderFinish", None)],
     "order_user_status": [("Work order", "WorkOrder", None), ("User status", "UserStatus", None),
                           ("Excluded", "Excluded", None)],
 }
@@ -511,6 +523,7 @@ _PAGE_LABELS = {
     "stock_list": "stock list", "issuable_stock": "WIP issuable list",
     "wo_component_remaining": "work-order components remaining", "component_issuance_14c": "14C component issuance",
     "issuance_summary_14c": "14C need vs. stock", "order_user_status": "COOIS user status",
+    "order_master": "PP134 order master",
 }
 _PAGE_FILTERS = {
     "work_order": "work order", "work_orders": "work orders", "material": "material", "materials": "materials",

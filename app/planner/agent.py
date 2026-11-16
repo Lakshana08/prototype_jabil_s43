@@ -25,7 +25,7 @@ SKILLS = {
     "material_status", "production_order", "material_report", "machine_head_review", "help",
     # Excel-based S43 reports (app.planner.reports)
     "stock_list", "issuable_stock", "wo_component_remaining", "component_issuance_14c",
-    "issuance_summary_14c", "order_user_status",
+    "issuance_summary_14c", "order_user_status", "order_master",
 }
 
 
@@ -39,6 +39,7 @@ SOURCES = {
     "wo_component": "Work Order Component List (Z_AGEDINV4 sheet 2)",
     "issuable": "WIP Issuable (Z_AGEDINV4)",
     "coois": "COOIS Order Status",
+    "order_master": "PP134 Order Master (PP-1341_1)",
     "issuance_14c": "14C Component Issuance (PP-GP-014C)",
 }
 # Per skill: the data sources it reads, then the checks it runs as (title, while running, detail).
@@ -95,6 +96,10 @@ SKILL_TRACE = {
     "issuance_summary_14c": (["issuance_14c"], [
         ("Compared need with stock", "Comparing need with stock",
          "Need vs. stock vs. issuable per storage location and material, as calculated in S43"),
+    ]),
+    "order_master": (["order_master"], [
+        ("Read order master", "Reading order master",
+         "Orders with type, issuance location, material, MRP controller, quantities and dates from PP134"),
     ]),
     "order_user_status": (["coois"], [
         ("Checked user status", "Checking user status",
@@ -340,6 +345,8 @@ class PlannerAgent:
             out.append(svc.issuable_stock("all", mats, slocs))
         if "user_status" in intents_:
             out.append(svc.order_user_status(orders))
+        if "order_master" in intents_:
+            out.append(svc.order_master(orders, mats, slocs, mrp, types))
         if "issuance_14c" in intents_:
             out.append(svc.component_issuance_14c(orders, mats, slocs, mrp, types) if orders
                        else svc.issuance_summary_14c(mats, slocs))
@@ -374,6 +381,8 @@ class PlannerAgent:
             return svc.issuance_summary_14c(mats, slocs)
         if skill == "order_user_status":
             return svc.order_user_status(all_orders)
+        if skill == "order_master":
+            return svc.order_master(all_orders, mats, slocs, mrp, types)
         return {
             "shortage_overview": lambda: svc.shortage_overview(mrp, types, mats),
             "aged_materials": lambda: svc.aged_materials(mats, slocs),
@@ -395,6 +404,7 @@ _CALL_LABELS = {
     "stock_list": "Stock list", "issuable_stock": "WIP issuable stock",
     "wo_component_remaining": "Work-order components remaining", "component_issuance_14c": "14C component issuance",
     "issuance_summary_14c": "14C need vs. stock", "order_user_status": "COOIS user status",
+    "order_master": "PP134 order master",
 }
 _ARG_LABELS = {
     "work_order": "work order", "work_orders": "work orders", "material": "material", "materials": "materials",
