@@ -22,6 +22,14 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
     "material": ["material master", "mrp type", "procurement", "lead time", "where is", "how much",
                  "inventory", "stock", "available"],
     "machine_head": ["machine-head", "machine head", "machinehead"],
+    # Excel-based S43 reports (app.planner.reports)
+    "stock_list": ["stock list", "inventory export", "aged inventory export", "z_agedinv", "agedinv"],
+    "wip_issuable": ["wip issuable", "wip-issuable", "issuable list", "可发料", "可发量"],
+    "putaway": ["putaway", "put-away", "put away", "待入库"],
+    "suffix_s": ["-s material", "suffix", "ending in -s", "ends with -s"],
+    "user_status": ["user status", "coois", "nmvt", "excluded order"],
+    "issuance_14c": ["14c"],
+    "wo_remaining": ["remaining to issue", "remaining qty", "remaining quantity", "left to issue"],
     "help": ["help", "what can you do", "capabilit"],
 }
 EXPORT_KEYWORDS = ["csv", "export", "download", "excel", "xlsx", "spreadsheet"]
@@ -82,6 +90,11 @@ def parse(text: str, source: LiveSource) -> ParsedQuery:
         elif tok.isupper() and (ot := source.find_order_type(up)) and ot not in q.order_types:
             q.order_types.append(ot)
 
+    # The report lists are more specific than the generic line-side status / inventory questions.
+    if set(q.intents) & {"wip_issuable", "putaway", "suffix_s"}:
+        q.intents = [i for i in q.intents if i not in ("material_status", "material")]
+    if "stock_list" in q.intents and "material" in q.intents:
+        q.intents.remove("material")
     # "machine-head" also contains no other keyword; "over-control" must not double as over-issued
     if "material_status" in q.intents and "over_issued" in q.intents and not _has_any(low, ["over-issue", "over issue", "overissue", "z67", "z68"]):
         q.intents.remove("over_issued")

@@ -59,13 +59,6 @@ class PlannerService:
             if rules.is_aged(i.get("AgingDays"), self.aging_threshold)
         ]
 
-    def _order_status_text(self, order: str) -> str:
-        wo = self.repo.shortage_by_order.get(order)
-        if wo and wo.get("OrderStatus"):
-            return wo["OrderStatus"]
-        po = self.repo.production_order_by_order.get(order, {})
-        return " ".join(s["StatusShortName"] for s in nav(po, "to_ProductionOrderStatus"))
-
     def _component_view(self, order_type: str, c: dict) -> dict:
         aged = self._aged_stock(c["Material"])
         return {
@@ -103,7 +96,7 @@ class PlannerService:
         if order_types and wo.get("ManufacturingOrderType") not in order_types:
             return False
         if materials:
-            mats = {wo["Material"].upper()} | {c["Material"].upper() for c in nav(wo, "to_ComponentShortage")}
+            mats = {wo["Material"].upper()} | {c["Material"].upper() for c in nav(wo, "_ComponentShortage")}
             if not mats & materials:
                 return False
         return True
@@ -118,7 +111,7 @@ class PlannerService:
         if not wo:
             return self._order_not_found("work_order_shortage", order)
         po = self.repo.production_order_by_order.get(order, {})
-        comps = [self._component_view(wo["ManufacturingOrderType"], c) for c in nav(wo, "to_ComponentShortage")]
+        comps = [self._component_view(wo["ManufacturingOrderType"], c) for c in nav(wo, "_ComponentShortage")]
         short = [c for c in comps if c["isShort"]]
         aged = [c for c in comps if c["isAged"]]
         over = [c for c in comps if c["overIssuedQty"] > 0]
@@ -189,7 +182,7 @@ class PlannerService:
                 lines.append("**Over-issued WIP:** none.")
 
         if review:
-            lines += ["", f"**Needs review (machine-head material candidate):** "
+            lines += ["", "**Needs review (machine-head material candidate):** "
                       + ", ".join(c["material"] for c in review)
                       + " - flagged for human review, not a resolved status."]
         if dq:
@@ -277,7 +270,7 @@ class PlannerService:
                   if self._order_matches(wo, mrp, order_types, materials)]
         short_orders = []
         for wo in orders:
-            comps = [c for c in nav(wo, "to_ComponentShortage") if rules.is_short(c)
+            comps = [c for c in nav(wo, "_ComponentShortage") if rules.is_short(c)
                      and (not materials or c["Material"].upper() in materials or wo["Material"].upper() in materials)]
             if comps:
                 short_orders.append((wo, comps))
@@ -420,7 +413,7 @@ class PlannerService:
                 continue
             if not self._order_matches(wo, mrp, order_types, set()):
                 continue
-            for c in nav(wo, "to_ComponentShortage"):
+            for c in nav(wo, "_ComponentShortage"):
                 if materials and c["Material"].upper() not in materials:
                     continue
                 qty = rules.over_issued_qty(c)
@@ -561,19 +554,19 @@ class PlannerService:
         if not po:
             return self._order_not_found("production_order", order)
         statuses = [{"code": s["StatusShortName"], "name": s["StatusName"], "userStatus": bool(s.get("IsUserStatus"))}
-                    for s in nav(po, "to_ProductionOrderStatus")]
+                    for s in nav(po, "_ProductionOrderStatus")]
         ops = [{"operation": o["ManufacturingOrderOperation"], "text": o.get("OperationText"),
                 "workCenter": o.get("WorkCenter"), "plannedQty": o.get("OpPlannedTotalQuantity"),
                 "confirmedYield": o.get("OpTotalConfirmedYieldQty"), "confirmedScrap": o.get("OpTotalConfirmedScrapQty"),
                 "start": _d(o.get("OpErlstSchedldExecStrtDte")), "end": _d(o.get("OpErlstSchedldExecEndDte"))}
-               for o in nav(po, "to_ProductionOrderOperation")]
+               for o in nav(po, "_ProductionOrderOperation")]
         comps = [{"item": c["ReservationItem"], "material": c["Material"], "description": c.get("ProductDescription"),
                   "storageLocation": c.get("StorageLocation"), "requiredQty": c.get("RequiredQuantity"),
                   "withdrawnQty": c.get("WithdrawnQuantity"), "baseUnit": c.get("BaseUnit"),
                   "requirementDate": _d(c.get("MatlCompRequirementDate")),
                   "componentType": c.get("MaterialComponentType"),
                   "dataQualityIssue": c.get("DataQualityIssue") or None}
-                 for c in nav(po, "to_ProductionOrderComponent")]
+                 for c in nav(po, "_ProductionOrderComponent")]
         header = {
             "workOrder": order, "orderType": po.get("ManufacturingOrderType"), "material": po.get("Material"),
             "description": po.get("ProductDescription"), "plant": po.get("ProductionPlant"),
@@ -644,8 +637,8 @@ class PlannerService:
                            f"Material **{material}** was not found in the material master or inventory for "
                            f"{self._plant_text()}.", result_type="not_found",
                            headline=f"I could not find material {material}. Please check the material number.")
-        plant = (nav(mm, "to_Plant") or [{}])[0] if mm else {}
-        val = (nav(mm, "to_Valuation") or [{}])[0] if mm else {}
+        plant = (nav(mm, "_Plant") or [{}])[0] if mm else {}
+        val = (nav(mm, "_Valuation") or [{}])[0] if mm else {}
         master = {
             "material": mm["Product"] if mm else material, "description": (mm or stock[0]).get("ProductDescription"),
             "materialType": mm.get("ProductType") if mm else stock[0].get("ProductType"),
@@ -656,7 +649,7 @@ class PlannerService:
             "grProcessingDays": plant.get("GoodsReceiptDuration"), "abcIndicator": plant.get("ABCIndicator"),
             "batchManaged": bool(plant.get("IsBatchManagementRequired")), "bulk": bool(plant.get("IsBulkMaterial")),
             "standardPrice": val.get("StandardPrice"), "priceUnit": val.get("PriceUnitQty"), "currency": val.get("Currency"),
-            "storageLocations": [s["StorageLocation"] for s in nav(mm, "to_StorageLocation")] if mm else [],
+            "storageLocations": [s["StorageLocation"] for s in nav(mm, "_StorageLocation")] if mm else [],
         }
         positions = []
         for i in sorted(stock, key=lambda x: x["StorageLocation"]):
@@ -672,7 +665,7 @@ class PlannerService:
             })
         demand = []
         for wo in self.repo.shortage_by_order.values():
-            for c in nav(wo, "to_ComponentShortage"):
+            for c in nav(wo, "_ComponentShortage"):
                 if c["Material"].upper() == key:
                     demand.append({"workOrder": wo["ManufacturingOrder"], "storageLocation": c.get("StorageLocation"),
                                    "requirementDate": _d(c.get("MatlCompRequirementDate")),
@@ -707,7 +700,6 @@ class PlannerService:
         if aged_pos:
             actions.append("Use aged stock first: " + ", ".join(
                 f"{p['storageLocation']} ({fmt(p['unrestricted'])} {unit}, {p['agingDays']} days)" for p in aged_pos) + ".")
-        cover = "covers" if total >= open_demand else "does NOT cover"
         return Section("material_report", f"Material {master['material']}", "\n".join(lines),
                        data={"master": master, "stock": positions, "demand": demand,
                              "totals": {"unrestricted": total, "openDemand": open_demand}},
@@ -738,7 +730,7 @@ class PlannerService:
         for wo in self.repo.shortage_by_order.values():
             if orders and wo["ManufacturingOrder"] not in orders:
                 continue
-            for c in nav(wo, "to_ComponentShortage"):
+            for c in nav(wo, "_ComponentShortage"):
                 if rules.needs_machine_head_review(wo["ManufacturingOrderType"], c):
                     rows.append({"WorkOrder": wo["ManufacturingOrder"], "OrderType": wo["ManufacturingOrderType"],
                                  "Component": c["Material"], "Description": c.get("ProductDescription"),

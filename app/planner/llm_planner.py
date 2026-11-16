@@ -20,6 +20,7 @@ from datetime import date, datetime, timezone
 
 from app.llm.aicore import AICoreChat, LLMError
 from app.planner import intents, paging, rules
+from app.planner.reports import ISSUABLE_VIEWS, clean_keys
 from app.planner.service import Section
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,8 @@ def _tool(name: str, desc: str, props: dict, required: list[str] | None = None) 
 
 
 WO = {"type": "string", "description": "9-digit work order / production order number, e.g. 121060001"}
+ANY_WO = _arr("9-digit work order numbers. These reports cover their own set of orders (e.g. 120921757), "
+              "not only the production orders")
 SKIP = {"type": "integer", "minimum": 0,
         "description": "Rows already shown. One page is 20 rows: 'rows 21-40' -> skip=20. Omit for the first page."}
 TOOLS = [
@@ -82,6 +85,46 @@ TOOLS = [
     _tool("machine_head_review",
           "Non-production (machine-head) orders that already consumed resin, paint or ink.",
           {"work_orders": _arr("Limit to these work orders")}),
+    # ---- Excel-based S43 reports (SMC_OData_V4_URLs.xlsx); quantities are calculated in S43
+    _tool("stock_list",
+          "Full stock list from the aged-inventory export (Z_AGEDINV4): every plant / storage location / "
+          "material with aging days, last placement date, unrestricted, consignment, blocked, quality-inspection "
+          "and in-transfer stock and stock value. Use for 'stock list', 'inventory export', stock categories "
+          "(blocked, QI, consignment) or stock older than N days.",
+          {"materials": _arr("Material numbers"), "storage_locations": _arr("Storage locations"),
+           "min_aging_days": {"type": "integer", "minimum": 0,
+                              "description": "Only stock not used for at least this many days"}}),
+    _tool("issuable_stock",
+          "SME's WIP issuable list (Z_AGEDINV4): per storage location + material the stock on hand, the "
+          "controlled quantity still to issue and the quantity available to issue, with status AV (available "
+          "to issue), OC (over-control / over-issued) or NC (non-controlled). view: 'all' = the full list, "
+          "'over_control' = the over-control sheet, 'putaway_pending' = stock waiting for put-away (receiving "
+          "locations), 'suffix_s' = materials whose number ends in -S.",
+          {"view": {"type": "string", "enum": list(ISSUABLE_VIEWS), "description": "Which list; default all"},
+           "materials": _arr("Material numbers"), "storage_locations": _arr("Storage locations"),
+           "statuses": _arr("Only these status codes", ["AV", "OC", "NC"])}),
+    _tool("wo_component_remaining",
+          "Work-order component list from the aged-inventory snapshot (Z_AGEDINV4 sheet 2): per order and "
+          "component the BOM theoretical quantity, actual usage, remaining quantity to issue and the total "
+          "remaining per storage location + material.",
+          {"work_orders": ANY_WO, "components": _arr("Component material numbers"),
+           "storage_locations": _arr("Storage locations"), "mrp_controllers": _arr("MRP controller codes"),
+           "order_types": _arr("Order types, e.g. ZPPC, ZNPC, ZRWC")}),
+    _tool("component_issuance_14c",
+          "14C component issuance report (PP-GP-014C-NSU, SME-modified): per work order and component the "
+          "quantity per, scrap %, theoretical usage, goods issued via CO11N and other movements, actual usage, "
+          "BOM theoretical quantity and remaining quantity (negative = issued more than the BOM requires).",
+          {"work_orders": ANY_WO, "components": _arr("Component material numbers"),
+           "storage_locations": _arr("Storage locations"), "mrp_controllers": _arr("MRP controller codes"),
+           "order_types": _arr("Order types")}),
+    _tool("issuance_summary_14c",
+          "14C summary (PP-GP-014C-NSU Sheet1): per storage location + material the open need, the stock and "
+          "the issuable quantity (= need - stock; negative = more stock than the open orders need).",
+          {"materials": _arr("Material numbers"), "storage_locations": _arr("Storage locations")}),
+    _tool("order_user_status",
+          "COOIS user status of work orders, e.g. NMVT (no material movement) - such orders are excluded "
+          "from the material checks. Use for 'user status', 'COOIS', 'NMVT' or 'which orders are excluded'.",
+          {"work_orders": ANY_WO, "excluded_only": {"type": "boolean", "description": "Only excluded orders"}}),
     _tool("attach_report",
           "Attach the detailed rows of the data fetched IN THIS TURN as a downloadable file. Always call the "
           "data tool(s) first in the same turn - also for a follow-up like 'give me that as Excel'. "
@@ -158,6 +201,11 @@ Meaning of the result fields:
 - storage_location_names: what each location code is (warehouse vs. a production line). Use it to say
   correctly where stock is; never call a line-side location "the warehouse".
 - overIssuedQty / z67z68Adjustment: issued beyond requirement and the adjustment postings for it.
+- Report tools (stock_list, issuable_stock, wo_component_remaining, component_issuance_14c,
+  issuance_summary_14c, order_user_status) show the SME's Excel reports as calculated in S43. Their work
+  orders are a different, larger set than the production orders: never call an order "not found" because
+  work_order_shortage did not know it - try the report tool. StockQty = stock on hand, StillToIssue =
+  controlled quantity still to issue, AvailableToIssue = stock minus still-to-issue (negative = deficit).
 
 Context: today is {today}. Data as of {as_of}. Aged = not used for more than {threshold} days."""
 
@@ -281,6 +329,8 @@ class LLMPlanner:
                 section = svc.material_report(next(iter(found)))
         elif name == "machine_head_review":
             section = svc.machine_head_review(set(orders(args.get("work_orders"))))
+        elif name in REPORT_TOOLS:
+            section = self._run_report(name, args, q, svc)
         else:
             return {"error": f"Unknown tool {name}"}
 
@@ -295,6 +345,37 @@ class LLMPlanner:
         if errors:
             result["warnings"] = errors
         return result
+
+    @staticmethod
+    def _run_report(name: str, args: dict, q: intents.ParsedQuery, svc) -> Section:
+        """Report tools filter S43 directly: keys are only cleaned, an unknown key simply returns no rows."""
+        for key in ("work_orders", "materials", "components", "storage_locations", "mrp_controllers",
+                    "order_types", "statuses"):
+            if args.get(key) not in (None, "", []):
+                args[key] = clean_keys(args[key])  # cleaned in place: the next-page prompt repeats them
+        wos, mats = args.get("work_orders") or [], args.get("materials") or []
+        comps, slocs = args.get("components") or [], args.get("storage_locations") or []
+        mrp, types = args.get("mrp_controllers") or [], args.get("order_types") or []
+        for target, values in ((q.work_orders, wos), (q.materials, mats + comps), (q.storage_locations, slocs),
+                               (q.mrp_controllers, mrp), (q.order_types, types)):
+            for v in values:
+                _add(target, v)
+        if name == "stock_list":
+            try:
+                min_age = int(args.get("min_aging_days") or 0) or None
+            except (TypeError, ValueError):
+                min_age = None
+            return svc.stock_list(mats, slocs, min_age)
+        if name == "issuable_stock":
+            view = args.get("view") if args.get("view") in ISSUABLE_VIEWS else "all"
+            return svc.issuable_stock(view, mats, slocs, args.get("statuses") or [])
+        if name == "wo_component_remaining":
+            return svc.wo_component_remaining(wos, comps or mats, slocs, mrp, types)
+        if name == "component_issuance_14c":
+            return svc.component_issuance_14c(wos, comps or mats, slocs, mrp, types)
+        if name == "issuance_summary_14c":
+            return svc.issuance_summary_14c(mats, slocs)
+        return svc.order_user_status(wos, bool(args.get("excluded_only")))
 
     # ------------------------------------------------------------------ memory
     def _past(self, context_id: str | None) -> list[dict]:
@@ -336,6 +417,9 @@ def _compact(s: Section, location_names: dict[str, str] | None = None, skip: int
     return out
 
 
+REPORT_TOOLS = {"stock_list", "issuable_stock", "wo_component_remaining", "component_issuance_14c",
+                "issuance_summary_14c", "order_user_status"}
+
 _PAGE_COLUMNS = {  # tool -> [(header, row key, unit key or None)]
     "over_issued": [("Work order", "WorkOrder", None), ("Component", "Component", None),
                     ("Description", "Description", None), ("Required", "RequiredQty", "BaseUnit"),
@@ -354,6 +438,25 @@ _PAGE_COLUMNS = {  # tool -> [(header, row key, unit key or None)]
     "machine_head_review": [("Work order", "WorkOrder", None), ("Component", "Component", None),
                             ("Description", "Description", None), ("Required", "RequiredQty", "BaseUnit"),
                             ("Actual", "ActualUsage", "BaseUnit"), ("Status", "Status", None)],
+    "stock_list": [("Material", "Material", None), ("Description", "Description", None),
+                   ("Location", "StorageLocation", None), ("Aging days", "AgingDays", None),
+                   ("Unrestricted", "Unrestricted", "BaseUnit"), ("Consignment", "UnrestrictedConsignment", "BaseUnit"),
+                   ("Value", "StockValue", "Currency")],
+    "issuable_stock": [("Location", "StorageLocation", None), ("Material", "Material", None),
+                       ("Description", "Description", None), ("Stock", "StockQty", "BaseUnit"),
+                       ("Still to issue", "StillToIssue", "BaseUnit"), ("Available", "AvailableToIssue", "BaseUnit"),
+                       ("Status", "Status", None)],
+    "wo_component_remaining": [("Work order", "WorkOrder", None), ("Component", "Component", None),
+                               ("Location", "StorageLocation", None), ("BOM qty", "BOMTheoreticalQty", "Unit"),
+                               ("Used", "ActualUsage", "Unit"), ("Remaining", "ActualRemainingQty", "Unit")],
+    "component_issuance_14c": [("Work order", "WorkOrder", None), ("Component", "Component", None),
+                               ("Location", "StorageLocation", None), ("BOM qty", "BOMTheoreticalQty", "Unit"),
+                               ("Issued CO11N", "IssuedCO11N", "Unit"), ("Issued other", "IssuedOther", "Unit"),
+                               ("Remaining", "RemainingQty", "Unit")],
+    "issuance_summary_14c": [("Location", "StorageLocation", None), ("Material", "Material", None),
+                             ("Need", "NeedQty", None), ("Stock", "StockQty", None), ("Issuable", "IssuableQty", None)],
+    "order_user_status": [("Work order", "WorkOrder", None), ("User status", "UserStatus", None),
+                          ("Excluded", "Excluded", None)],
 }
 
 
@@ -405,11 +508,16 @@ _PAGE_LABELS = {
     "shortage_overview": "shortage overview", "aged_materials": "aged stock", "over_issued": "over-issued material",
     "material_status": "line-side control status", "material_report": "material report",
     "machine_head_review": "machine-head review",
+    "stock_list": "stock list", "issuable_stock": "WIP issuable list",
+    "wo_component_remaining": "work-order components remaining", "component_issuance_14c": "14C component issuance",
+    "issuance_summary_14c": "14C need vs. stock", "order_user_status": "COOIS user status",
 }
 _PAGE_FILTERS = {
     "work_order": "work order", "work_orders": "work orders", "material": "material", "materials": "materials",
     "storage_locations": "storage location", "mrp_controllers": "MRP controller", "order_types": "order type",
     "topics": "topics", "status": "status",
+    "view": "list", "statuses": "status", "components": "components", "min_aging_days": "aged at least (days)",
+    "excluded_only": "excluded only",
 }
 
 

@@ -2,6 +2,8 @@
 import os
 from pathlib import Path
 
+from app.data.s4_apis import SERVICE_PATH
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -31,9 +33,8 @@ def _bool_or_path(value: str) -> bool | str:
     return value  # path to a CA bundle (.pem) for the S43 certificate
 
 
-# Live S43 OData service (client 100).
-SAP_ODATA_BASE_URL = os.getenv(
-    "SAP_ODATA_BASE_URL", "https://192.168.8.69:44300/sap/opu/odata/sap/ZSB_SMC_MATERIAL_V2")
+# Live S43 OData V4 service zsd_smc_material (client 100), see SMC_OData_V4_URLs.xlsx.
+SAP_ODATA_BASE_URL = os.getenv("SAP_ODATA_BASE_URL", "https://192.168.8.69:44300" + SERVICE_PATH)
 SAP_CLIENT = os.getenv("SAP_CLIENT", "100")
 SAP_USER = os.getenv("SAP_USER", "")
 SAP_PASSWORD = os.getenv("SAP_PASSWORD", "")
@@ -45,8 +46,7 @@ SAP_TIMEOUT_SECONDS = float(os.getenv("SAP_TIMEOUT_SECONDS", "60"))
 # SAP_ODATA_BASE_URL / SAP_USER / SAP_PASSWORD are ignored. Leave empty for local runs.
 SAP_DESTINATION_NAME = os.getenv("SAP_DESTINATION_NAME", "").strip()
 # OData service path appended to the destination URL (unless the destination URL already contains it).
-SAP_ODATA_SERVICE_PATH = os.getenv("SAP_ODATA_SERVICE_PATH", "/sap/opu/odata/sap/ZSB_SMC_MATERIAL_V2")
-
+SAP_ODATA_SERVICE_PATH = os.getenv("SAP_ODATA_SERVICE_PATH", SERVICE_PATH)
 
 
 # Aging threshold in days. Default 14 (global KPI); changed only by an authorized administrator

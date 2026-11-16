@@ -1,8 +1,8 @@
 """Backend data access layer - live, per question.
 
 Nothing is loaded at start-up and nothing is kept between questions. Every question reads
-only the records it needs from the S43 OData V2 service ``ZSB_SMC_MATERIAL_V2`` with
-server-side ``$filter`` (CDS views ZC_SMC_*, see ``SMC_All_OData_URLs_Complete 3.xlsx``) and
+only the records it needs from the S43 OData V4 service ``zsd_smc_material`` with
+server-side ``$filter`` (CDS views ZC_SMC_*, registry in ``app.data.s4_apis``) and
 puts them in a small ``DataRepository`` *snapshot*. The business rules in ``app.planner.service``
 run on that snapshot, so the rule logic does not depend on how the data was fetched.
 
@@ -19,37 +19,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable
 
+from app.data import s4_apis as s4
 from app.data.odata import ODataClient, ODataError, all_of, any_of, eq
 
 log = logging.getLogger(__name__)
 
-CHUNK = 25  # keys per OData $filter (V2 has no "in"; each key is an "or" term)
+CHUNK = 25  # keys per OData $filter (each key is an "or" term)
 
-ORDER_SET = "ProductionOrder"
-SHORTAGE_SET = "WorkOrderShortage"
-COMPONENT_SET = "ComponentShortage"
-MASTER_SET = "MaterialMaster"
-INVENTORY_SET = "Inventory"
-SLOC_SET = "MaterialStorageLocation"
-
-# Entity sets + $expand, so records arrive in the nested shape the rules expect.
-ODATA_SOURCES = {
-    "work_order_shortage": (SHORTAGE_SET, ["to_ComponentShortage"]),
-    "production_order": (ORDER_SET, ["to_ProductionOrderComponent", "to_ProductionOrderOperation",
-                                     "to_ProductionOrderStatus"]),
-    "material_master": (MASTER_SET, ["to_Plant", "to_Valuation", "to_StorageLocation", "to_BillOfMaterialItem"]),
-    "inventory": (INVENTORY_SET, []),
-    "demand": (COMPONENT_SET, []),
-}
-
-# Minimal header contract per source; a response missing these is rejected rather than half-used.
-REQUIRED_FIELDS = {
-    "work_order_shortage": ["ManufacturingOrder", "Material", "OrderShortageStatus", "to_ComponentShortage"],
-    "production_order": ["ManufacturingOrder", "Material", "TotalQuantity", "to_ProductionOrderStatus"],
-    "material_master": ["Product", "ProductDescription", "BaseUnit"],
-    "inventory": ["Material", "StorageLocation", "Unrestricted", "AgingDays"],
-    "demand": ["ManufacturingOrder", "Material"],
-}
+# Entity sets used for ID look-ups; everything else is read by source name via s4.BY_NAME.
+ORDER_SET = s4.PRODUCTION_ORDER.entity_set
+SHORTAGE_SET = s4.WORK_ORDER_SHORTAGE.entity_set
+COMPONENT_SET = s4.COMPONENT_SHORTAGE.entity_set
+MASTER_SET = s4.MATERIAL_MASTER.entity_set
+INVENTORY_SET = s4.INVENTORY.entity_set
+SLOC_SET = s4.MATERIAL_STORAGE_LOCATION.entity_set
 
 
 class DataLoadError(RuntimeError):
@@ -109,7 +92,7 @@ class DataRepository:
     def add_master(self, rows: Iterable[dict]) -> None:
         for rec in rows:
             self.material_master[rec["Product"].upper()] = rec
-            for sl in nav(rec, "to_StorageLocation"):
+            for sl in nav(rec, "_StorageLocation"):
                 if sl.get("StorageLocation"):
                     self.storage_location_names.setdefault(sl["StorageLocation"], sl.get("StorageLocationName", ""))
 
@@ -117,7 +100,7 @@ class DataRepository:
         return "line-side" in self.storage_location_names.get(storage_location, "").lower()
 
     def components(self, order: str) -> list[dict]:
-        return nav(self.shortage_by_order.get(order, {}), "to_ComponentShortage")
+        return nav(self.shortage_by_order.get(order, {}), "_ComponentShortage")
 
     def all_components(self) -> Iterable[dict]:
         for order in self.shortage_by_order:
@@ -130,9 +113,8 @@ class DataRepository:
 
 
 def nav(record: dict, prop: str) -> list[dict]:
-    """Read an OData navigation property ({"results": [...]}) safely."""
-    value = record.get(prop) or {}
-    return value.get("results", []) if isinstance(value, dict) else list(value)
+    """Rows of an expanded V4 navigation property (``_ComponentShortage: [...]``); [] when absent."""
+    return list(record.get(prop) or [])
 
 
 def _chunks(values: Iterable[str], size: int = CHUNK):
@@ -152,14 +134,16 @@ class LiveSource:
         from app import config  # local import: config is optional for library use
         if config.SAP_DESTINATION_NAME:
             return cls(_destination_client(config))
+        if "/odata4/" not in config.SAP_ODATA_BASE_URL.lower():
+            raise DataLoadError(
+                f"SAP_ODATA_BASE_URL is not the OData V4 service: {config.SAP_ODATA_BASE_URL}\n"
+                f"  Set it in .env to https://<host>:<port>{s4.SERVICE_PATH} (see SMC_OData_V4_URLs.xlsx).")
         if not config.SAP_USER:
             log.warning("SAP_USER is not set - S43 will most likely answer 401 Unauthorized")
         return cls(ODataClient(
             base_url=config.SAP_ODATA_BASE_URL, client=config.SAP_CLIENT, user=config.SAP_USER,
             password=config.SAP_PASSWORD, verify_ssl=config.SAP_VERIFY_SSL,
             timeout=config.SAP_TIMEOUT_SECONDS))
-
-    is_live = True
 
     def check(self) -> None:
         """Fail fast at start-up when S43 cannot be reached (one record, nothing kept)."""
@@ -168,7 +152,7 @@ class LiveSource:
     def provenance(self) -> dict:
         fetches = _FETCHES.get() or {}
         return {
-            "dataSource": "Live SAP S43 (OData ZSB_SMC_MATERIAL_V2), read for this question",
+            "dataSource": f"Live SAP S43 ({self.odata.service_name}), read for this question",
             "dataAsOf": min((s.generated_on for s in fetches.values()), default=_now()),
             "sources": {k: vars(v) for k, v in fetches.items()},
         }
@@ -181,15 +165,16 @@ class LiveSource:
             raise DataLoadError(f"S43 OData {entity}: {exc}") from exc
 
     def _fetch(self, key: str, filter: str | None = None, top: int | None = None) -> list[dict]:
-        """Records of a source matching ``filter``; logged for the answer's data-as-of line."""
-        entity, expand = ODATA_SOURCES[key]
+        """Records of a source (``s4_apis.BY_NAME``) matching ``filter``; logged for the data-as-of line."""
+        api = s4.BY_NAME[key]
+        entity, expand = api.entity_set, list(api.expand)
         rows = self._read(entity, expand=expand, filter=filter, top=top)
-        missing = sorted({f for rec in rows for f in REQUIRED_FIELDS[key] if f not in rec})
+        missing = sorted({f for rec in rows for f in api.required_fields if f not in rec})
         if missing:
             raise DataLoadError(f"{entity}: records missing required fields {missing}")
         now = _now()
         _record_fetch(key, SourceInfo(file=self.odata.url(entity, expand, filter, top),
-                                      entity=f"{entity} (ZSB_SMC_MATERIAL_V2, S43 client {self.odata.client})",
+                                      entity=f"{entity} ({self.odata.service_name}, S43 client {self.odata.client})",
                                       record_count=len(rows), generated_on=now, loaded_at=now))
         return rows
 
@@ -329,6 +314,20 @@ class LiveSource:
         snap.shortage_by_order = self._work_orders(None, self._orders_with_material([material]))
         self._names(snap)
         return snap
+
+    def report_rows(self, key: str, filters: dict[str, Iterable[str]] | None = None,
+                    extra: str | None = None) -> list[dict]:
+        """Flat report rows (``stock_list``, ``issuable_*``, ``order_user_status``, ``issuance_14c``...).
+
+        ``filters`` maps a field to the allowed values (server-side ``eq`` / ``or``); ``extra`` is a
+        ready-built clause such as ``AgingDays ge 30``. Long value lists are read in chunks.
+        """
+        clauses = {f: sorted(set(v)) for f, v in (filters or {}).items() if v}
+        if not clauses:
+            return self._fetch(key, extra)
+        big = max(clauses, key=lambda f: len(clauses[f]))
+        rest = all_of(*(any_of(f, v) for f, v in clauses.items() if f != big), extra)
+        return self._fetch_keys(key, big, clauses[big], rest)
 
     def for_help(self) -> DataRepository:
         snap = DataRepository()
