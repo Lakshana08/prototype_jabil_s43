@@ -6,6 +6,7 @@ small snapshot from S43 with server-side filters, then runs the rules on it. Not
 from __future__ import annotations
 
 from app.data.repository import DataRepository, LiveSource
+from app.planner.reports import ReportService
 from app.planner.service import PlannerService, Section
 
 
@@ -15,6 +16,8 @@ class LiveService:
     def __init__(self, source: LiveSource, aging_threshold_days: int):
         self.source = source
         self.aging_threshold = aging_threshold_days
+        # Excel-based S43 reports (Sheet1..6, COOIS, MOD14C): flat rows, quantities calculated in S43.
+        self.reports = ReportService(source, aging_threshold_days)
 
     def _run(self, snap: DataRepository, skill: str, *args) -> Section:
         section = getattr(PlannerService(snap, self.aging_threshold), skill)(*args)
@@ -52,3 +55,22 @@ class LiveService:
 
     def help(self) -> Section:
         return self._run(self.source.for_help(), "help")
+
+    # ------------------------------------------------------------------ Excel-based S43 reports
+    def stock_list(self, materials=(), slocs=(), min_aging_days: int | None = None) -> Section:
+        return self.reports.stock_list(materials, slocs, min_aging_days)
+
+    def issuable_stock(self, view: str = "all", materials=(), slocs=(), statuses=()) -> Section:
+        return self.reports.issuable_stock(view, materials, slocs, statuses)
+
+    def wo_component_remaining(self, orders=(), components=(), slocs=(), mrp=(), order_types=()) -> Section:
+        return self.reports.wo_component_remaining(orders, components, slocs, mrp, order_types)
+
+    def component_issuance_14c(self, orders=(), components=(), slocs=(), mrp=(), order_types=()) -> Section:
+        return self.reports.component_issuance_14c(orders, components, slocs, mrp, order_types)
+
+    def issuance_summary_14c(self, materials=(), slocs=()) -> Section:
+        return self.reports.issuance_summary_14c(materials, slocs)
+
+    def order_user_status(self, orders=(), excluded_only: bool = False) -> Section:
+        return self.reports.order_user_status(orders, excluded_only)

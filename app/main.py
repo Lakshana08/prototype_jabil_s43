@@ -82,6 +82,28 @@ def planner_card() -> dict:
             {"id": "machine_head_review", "name": "Machine-head review",
              "description": "Candidate machine-head material lines - always marked 'needs review'.",
              "tags": ["machine-head", "review"], "examples": ["Show machine-head material needing review"]},
+            # Excel-based S43 reports (SMC_OData_V4_URLs.xlsx)
+            {"id": "stock_list", "name": "Stock list (aged inventory export)",
+             "description": "Z_AGEDINV4 stock per storage location and material with aging and all stock categories. "
+                            "Filters: material, storageLocation.",
+             "tags": ["inventory", "aging"], "examples": ["Show the stock list for A201"]},
+            {"id": "issuable_stock", "name": "WIP issuable list",
+             "description": "SME WIP issuable list: stock vs. controlled quantity still to issue (AV / OC / NC), "
+                            "incl. over-control, put-away pending and '-S' views.",
+             "tags": ["issuable", "over-control", "putaway"], "examples": ["Which stock is waiting for put-away?"]},
+            {"id": "wo_component_remaining", "name": "Work-order components remaining",
+             "description": "Z_AGEDINV4 sheet 2: BOM quantity, usage and remaining quantity per order component. "
+                            "Params: workOrder, material, storageLocation, mrpController, orderType.",
+             "tags": ["work order", "components"], "examples": ["Remaining quantity to issue for order 121040317"]},
+            {"id": "component_issuance_14c", "name": "14C component issuance",
+             "description": "PP-GP-014C-NSU: issued (CO11N / other) vs. BOM quantity per order component.",
+             "tags": ["14C", "issuance"], "examples": ["Show the 14C issuance for order 120921757"]},
+            {"id": "issuance_summary_14c", "name": "14C need vs. stock",
+             "description": "PP-GP-014C-NSU summary: need, stock and issuable per storage location and material.",
+             "tags": ["14C", "issuable"], "examples": ["14C summary for A201"]},
+            {"id": "order_user_status", "name": "COOIS user status",
+             "description": "User status per work order (NMVT = excluded from the material checks).",
+             "tags": ["COOIS", "NMVT"], "examples": ["Which orders have user status NMVT?"]},
         ],
     }
 
@@ -102,7 +124,7 @@ async def no_stale_ui(request, call_next):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "agents": [PLANNER_PATH], "dataSource": "Live SAP S43 (OData ZSB_SMC_MATERIAL_V2), read per question"}
+    return {"status": "ok", "agents": [PLANNER_PATH], "dataSource": f"Live SAP S43 ({source.odata.service_name}), read per question"}
 
 
 # Chat UI (frontend/) served at /ui

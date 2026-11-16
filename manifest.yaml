@@ -20,7 +20,7 @@ applications:
       - smart-material-ai-connectivity   # Connectivity service - proxy to the SAP Cloud Connector
     env:
       SAP_DESTINATION_NAME: S43   
-      SAP_ODATA_SERVICE_PATH: /sap/opu/odata/sap/ZSB_SMC_MATERIAL_V2
+      SAP_ODATA_SERVICE_PATH: /sap/opu/odata4/sap/zsb_smc_material/srvd_a2x/sap/zsd_smc_material/0001
       SAP_CLIENT: "100"     # used only if the destination has no sap-client property
       SAP_TIMEOUT_SECONDS: "60"
       AGING_THRESHOLD_DAYS: "14"

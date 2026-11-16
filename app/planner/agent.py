@@ -23,6 +23,9 @@ log = logging.getLogger(__name__)
 SKILLS = {
     "work_order_shortage", "shortage_overview", "aged_materials", "over_issued",
     "material_status", "production_order", "material_report", "machine_head_review", "help",
+    # Excel-based S43 reports (app.planner.reports)
+    "stock_list", "issuable_stock", "wo_component_remaining", "component_issuance_14c",
+    "issuance_summary_14c", "order_user_status",
 }
 
 
@@ -32,6 +35,11 @@ SOURCES = {
     "production": "Production Order",
     "master": "Material Master",
     "inventory": "Inventory",
+    "stock_list": "Aged Inventory Export (Z_AGEDINV4)",
+    "wo_component": "Work Order Component List (Z_AGEDINV4 sheet 2)",
+    "issuable": "WIP Issuable (Z_AGEDINV4)",
+    "coois": "COOIS Order Status",
+    "issuance_14c": "14C Component Issuance (PP-GP-014C)",
 }
 # Per skill: the data sources it reads, then the checks it runs as (title, while running, detail).
 SKILL_TRACE = {
@@ -68,6 +76,29 @@ SKILL_TRACE = {
     "machine_head_review": (["shortage"], [
         ("Screened for machine-head material", "Screening for machine-head material",
          "Looked at non-production orders with resin, paint or ink already issued"),
+    ]),
+    "stock_list": (["stock_list"], [
+        ("Checked stock age", "Checking stock age", "Flagged stock not used for more than {T} days"),
+    ]),
+    "issuable_stock": (["issuable"], [
+        ("Compared stock with quantity to issue", "Comparing stock with quantity to issue",
+         "Stock on hand vs. controlled quantity still to issue, as calculated in S43"),
+    ]),
+    "wo_component_remaining": (["wo_component"], [
+        ("Checked remaining quantity", "Checking remaining quantity",
+         "BOM quantity vs. actual usage per work-order component, as calculated in S43"),
+    ]),
+    "component_issuance_14c": (["issuance_14c"], [
+        ("Checked component issuance", "Checking component issuance",
+         "Issued quantity (CO11N and other) vs. BOM quantity incl. scrap, as calculated in S43"),
+    ]),
+    "issuance_summary_14c": (["issuance_14c"], [
+        ("Compared need with stock", "Comparing need with stock",
+         "Need vs. stock vs. issuable per storage location and material, as calculated in S43"),
+    ]),
+    "order_user_status": (["coois"], [
+        ("Checked user status", "Checking user status",
+         "Orders with user status NMVT are excluded from the material checks"),
     ]),
 }
 
@@ -228,6 +259,11 @@ class PlannerAgent:
             return "Stock by material and storage location"
         if source == "master":
             return f"Material details for {', '.join(q.materials)}" if q.materials else "Material details"
+        if source in ("stock_list", "wo_component", "issuable", "coois", "issuance_14c"):
+            filters = [f"{label} {', '.join(values)}" for label, values in (
+                ("work order", q.work_orders + q.unknown_orders), ("material", q.materials),
+                ("storage location", q.storage_locations), ("MRP controller", q.mrp_controllers)) if values]
+            return "Rows for " + "; ".join(filters) if filters else "All rows"
         return ""
 
     # ------------------------------------------------------------------ routing
@@ -243,6 +279,12 @@ class PlannerAgent:
 
         sections: list[Section] = []
         intents_ = set(q.intents)
+
+        # Report questions (14C, COOIS, sheet 2...) may name orders outside the production-order set.
+        report_sections = self._route_reports(q, intents_)
+        if report_sections and not intents_ & {"shortage", "aged", "over_issued", "production_order",
+                                               "machine_head", "material_status"}:
+            return report_sections
 
         # Work order(s) named: the consolidated planner view (shortage + aged + over-issued) per order.
         if orders:
@@ -270,6 +312,7 @@ class PlannerAgent:
             sections.append(svc.material_status(mats, slocs, _status_filter(q.text)))
         if "machine_head" in intents_:
             sections.append(svc.machine_head_review())
+        sections += report_sections
         if mats and (not sections or "material" in intents_ or "production_order" in intents_):
             sections += [svc.material_report(m) for m in q.materials]
         if not sections and (slocs or "material" in intents_):
@@ -279,6 +322,30 @@ class PlannerAgent:
         if not sections:
             sections.append(svc.help())
         return sections
+
+    def _route_reports(self, q: intents.ParsedQuery, intents_: set[str]) -> list[Section]:
+        """Excel-based S43 reports. Their orders are often not production orders, so unknown ones count too."""
+        svc = self.service
+        mats, slocs = set(q.materials), set(q.storage_locations)
+        orders = set(q.work_orders) | set(q.unknown_orders)
+        mrp, types = set(q.mrp_controllers), set(q.order_types)
+        out: list[Section] = []
+        if "stock_list" in intents_:
+            out.append(svc.stock_list(mats, slocs))
+        if "putaway" in intents_:
+            out.append(svc.issuable_stock("putaway_pending", mats, slocs))
+        if "suffix_s" in intents_:
+            out.append(svc.issuable_stock("suffix_s", mats, slocs))
+        if "wip_issuable" in intents_:
+            out.append(svc.issuable_stock("all", mats, slocs))
+        if "user_status" in intents_:
+            out.append(svc.order_user_status(orders))
+        if "issuance_14c" in intents_:
+            out.append(svc.component_issuance_14c(orders, mats, slocs, mrp, types) if orders
+                       else svc.issuance_summary_14c(mats, slocs))
+        if "wo_remaining" in intents_:
+            out.append(svc.wo_component_remaining(orders, mats, slocs, mrp, types))
+        return out
 
     def _run_skill(self, skill: str, q: intents.ParsedQuery) -> Section:
         svc = self.service
@@ -294,6 +361,19 @@ class PlannerAgent:
             if not q.materials:
                 raise ValueError("Skill 'material_report' requires 'material'")
             return svc.material_report(q.materials[0])
+        all_orders = orders | set(q.unknown_orders)
+        if skill == "stock_list":
+            return svc.stock_list(mats, slocs)
+        if skill == "issuable_stock":
+            return svc.issuable_stock("all", mats, slocs)
+        if skill == "wo_component_remaining":
+            return svc.wo_component_remaining(all_orders, mats, slocs, mrp, types)
+        if skill == "component_issuance_14c":
+            return svc.component_issuance_14c(all_orders, mats, slocs, mrp, types)
+        if skill == "issuance_summary_14c":
+            return svc.issuance_summary_14c(mats, slocs)
+        if skill == "order_user_status":
+            return svc.order_user_status(all_orders)
         return {
             "shortage_overview": lambda: svc.shortage_overview(mrp, types, mats),
             "aged_materials": lambda: svc.aged_materials(mats, slocs),
@@ -312,11 +392,16 @@ _CALL_LABELS = {
     "shortage_overview": "Shortage overview", "aged_materials": "Aged stock", "over_issued": "Over-issue check",
     "material_status": "Line-side control status", "material_report": "Material report",
     "machine_head_review": "Machine-head review", "attach_report": "Attach file",
+    "stock_list": "Stock list", "issuable_stock": "WIP issuable stock",
+    "wo_component_remaining": "Work-order components remaining", "component_issuance_14c": "14C component issuance",
+    "issuance_summary_14c": "14C need vs. stock", "order_user_status": "COOIS user status",
 }
 _ARG_LABELS = {
     "work_order": "work order", "work_orders": "work orders", "material": "material", "materials": "materials",
     "storage_locations": "storage location", "mrp_controllers": "MRP controller", "order_types": "order type",
     "topics": "topics", "status": "status", "format": "format",
+    "view": "list", "statuses": "status", "components": "components", "min_aging_days": "aged at least (days)",
+    "excluded_only": "excluded only",
 }
 
 
