@@ -11,7 +11,7 @@ backend is the separate Python app in `../backend`, called over HTTP:
 | File | Purpose |
 |---|---|
 | `index.html`, `app.js`, `styles.css` | The UI |
-| `config.js` | Backend URL (`apiBase`) - the only setting |
+| `config.js` | Backend URL: local backend on localhost, deployed backend everywhere else |
 | `manifest.yml`, `Staticfile`, `.cfignore` | Cloud Foundry deployment (staticfile buildpack) |
 
 ## Run locally
@@ -23,7 +23,7 @@ backend is the separate Python app in `../backend`, called over HTTP:
 ## Deploy to SAP BTP Cloud Foundry
 
 1. Deploy the backend first (`cf push` in `backend/`) and note its route (`cf app smart-material-chat-s43`).
-2. Put that route in `config.js`: `apiBase: "https://<backend-route>"`.
+2. If the backend route changed, update `DEPLOYED_BACKEND` in `config.js`.
 3. In `frontend/`: `cf push`
 4. Open the UI route shown by `cf push`.
 
