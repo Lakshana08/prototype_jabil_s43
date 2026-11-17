@@ -1,7 +1,7 @@
 # Smart Material AI Chat - frontend
 
 Static chat UI (HTML/CSS/JS, no build step) for the Planner agent. It is deployed on its own; the
-backend is the separate Python app in the repo root (`../app`), called over HTTP:
+backend is the separate Python app in `../backend`, called over HTTP:
 
 - `POST {apiBase}/a2a/planner` - A2A 1.0 JSON-RPC (`SendMessage`)
 - `GET  {apiBase}/a2a/planner/.well-known/agent-card.json`, `GET {apiBase}/health`
@@ -16,13 +16,13 @@ backend is the separate Python app in the repo root (`../app`), called over HTTP
 
 ## Run locally
 
-1. Start the backend (repo root): `python -m uvicorn app.main:app --port 8000`
+1. Start the backend (in `backend/`): `python -m uvicorn app.main:app --port 8000`
 2. In `frontend/`: `python -m http.server 5500`
 3. Open http://localhost:5500
 
 ## Deploy to SAP BTP Cloud Foundry
 
-1. Deploy the backend first (`cf push` in the repo root - its `.cfignore` leaves `frontend/` out) and note its route (`cf app smart-material-chat-s43`).
+1. Deploy the backend first (`cf push` in `backend/`) and note its route (`cf app smart-material-chat-s43`).
 2. Put that route in `config.js`: `apiBase: "https://<backend-route>"`.
 3. In `frontend/`: `cf push`
 4. Open the UI route shown by `cf push`.

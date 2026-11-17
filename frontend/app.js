@@ -5,7 +5,7 @@
 (() => {
   "use strict";
 
-  // The backend is a separate app (repo root, ../app). Its URL comes from, in order:
+  // The backend is a separate app (../backend). Its URL comes from, in order:
   // ?api=https://<backend-host>  ->  config.js (window.APP_CONFIG.apiBase)  ->  http://localhost:8000
   const params = new URLSearchParams(location.search);
   const API_BASE = (params.get("api") || (window.APP_CONFIG || {}).apiBase || "http://localhost:8000")
@@ -47,7 +47,7 @@
       if (params.get("q")) ask(params.get("q")); // deep link: /ui/?q=...
     } catch (e) {
       setConn("err", "Agent offline");
-      els.desc.textContent = `Cannot reach ${AGENT_URL}. Start the backend: python -m uvicorn app.main:app --port 8000`;
+      els.desc.textContent = `Cannot reach ${AGENT_URL}. Start the backend: cd backend && python -m uvicorn app.main:app --port 8000`;
     }
   }
 
