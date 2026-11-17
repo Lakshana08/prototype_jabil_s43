@@ -5,9 +5,11 @@
 (() => {
   "use strict";
 
-  // Same origin when served by FastAPI (/ui); override with ?api=http://host:port
+  // The backend is a separate app (repo root, ../app). Its URL comes from, in order:
+  // ?api=https://<backend-host>  ->  config.js (window.APP_CONFIG.apiBase)  ->  http://localhost:8000
   const params = new URLSearchParams(location.search);
-  const API_BASE = params.get("api") || (location.protocol.startsWith("http") ? location.origin : "http://localhost:8000");
+  const API_BASE = (params.get("api") || (window.APP_CONFIG || {}).apiBase || "http://localhost:8000")
+    .replace(/\/+$/, "");
   const AGENT_URL = `${API_BASE}/a2a/planner`;
 
   const $ = (id) => document.getElementById(id);
@@ -114,24 +116,23 @@
     }
   }
 
-  /** One A2A message/send; `exportFormat` ("xlsx" or "csv") asks the agent to attach the data as a file. */
+  /** One A2A 1.0 SendMessage; `exportFormat` ("xlsx" or "csv") asks the agent to attach the data as a file. */
   async function send(question, exportFormat = "") {
-    const message = {
-      kind: "message", role: "user", messageId: uuid(),
-      parts: [{ kind: "text", text: question }],
-    };
-    if (exportFormat) message.parts.push({ kind: "data", data: { export: true, format: exportFormat } });
+    const message = { messageId: uuid(), role: "ROLE_USER", parts: [{ text: question }] };
+    if (exportFormat) message.parts.push({ data: { export: true, format: exportFormat } });
     if (contextId) message.contextId = contextId;
     const res = await fetchJson(AGENT_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: uuid(), method: "message/send", params: { message } }),
+      body: JSON.stringify({ jsonrpc: "2.0", id: uuid(), method: "SendMessage", params: { message } }),
     });
     if (res.error) throw new Error(`${res.error.message}${res.error.data?.correlationId ? ` (ref ${res.error.data.correlationId})` : ""}`);
-    return res.result;
+    return res.result.task;
   }
 
-  const fileParts = (task) => (task.artifacts || []).flatMap((a) => a.parts).filter((p) => p.kind === "file").map((p) => p.file);
+  // A2A 1.0 file parts: { raw (base64), filename, mediaType }
+  const fileParts = (task) => (task.artifacts || []).flatMap((a) => a.parts).filter((p) => p.raw)
+    .map((p) => ({ name: p.filename, mimeType: p.mediaType, bytes: p.raw }));
 
   /** "Would you like a report?" prompt under an answer; the button fetches the CSV and downloads it. */
   function reportPrompt(question) {
@@ -197,11 +198,11 @@
   }
 
   async function addAgent(task, ms, question) {
-    const arts = task.artifacts || [];
-    const textPart = task.status?.message?.parts?.find((p) => p.kind === "text");
-    const data = arts.flatMap((a) => a.parts).find((p) => p.kind === "data")?.data || {};
+    const parts = task.status?.message?.parts || [];
+    const textPart = parts.find((p) => typeof p.text === "string");
+    const data = parts.find((p) => p.data)?.data || {};
     const files = fileParts(task);
-    const results = data.results || [];
+    const results = data.tool_results || [];
 
     const card = el("div", "card");
     const row = push(agentRow(card));
@@ -240,7 +241,7 @@
         foot.appendChild(b);
       }
       card.appendChild(foot);
-    } else if (question && results.some((r) => r.rowCount > 0)) {
+    } else if (question && results.some((r) => r.count > 0)) {
       card.appendChild(reportPrompt(question));
     }
     if (data.next_page_prompt) card.appendChild(nextPageButton(data.next_page_prompt));

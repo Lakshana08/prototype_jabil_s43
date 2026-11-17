@@ -1,0 +1,10 @@
+# SAP BTP Cloud Foundry deployment of the chat UI (static files only).
+# Before pushing, set apiBase in config.js to the backend's route. Then:  cf push
+applications:
+  - name: smart-material-chat-ui
+    memory: 64M
+    disk_quota: 128M
+    instances: 1
+    buildpacks:
+      - staticfile_buildpack
+    random-route: true
