@@ -347,8 +347,10 @@ class LLMPlanner:
         skip = paging.resolve_skip(args.get("skip"), requested_skip)
         result = _compact(section, section.location_names, skip)
         meta = {k: result[k] for k in ("count", "skip", "returned", "has_more")}
+        section.skip = skip
+        section.next_page_prompt = paging.next_page_prompt(_page_subject(name, args), meta)
         result["_page"] = {**meta, "table": _page_table(name, paging.page_slice(section.rows, skip)),
-                           "next_page_prompt": paging.next_page_prompt(_page_subject(name, args), meta)}
+                           "next_page_prompt": section.next_page_prompt}
         if errors:
             result["warnings"] = errors
         return result

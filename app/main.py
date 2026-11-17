@@ -1,142 +1,82 @@
-"""FastAPI entry point: exposes the Planner agent over A2A at /a2a/planner."""
+"""Entry point of the backend.
+
+Run:  python -m uvicorn app.main:app --port 8000
+
+Startup, in three steps:
+  1. connect_to_s43()   - open the live S43 OData V4 service (stop if it cannot be reached)
+  2. build_planner()    - create the Planner agent, with GPT-4o on SAP AI Core when it is configured
+  3. create_app()       - FastAPI app with the A2A endpoint /a2a/planner and /health
+
+The agent card (skills list) is in app/a2a/agent_card.py, the A2A protocol in app/a2a/server.py.
+"""
 import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-from fastapi.staticfiles import StaticFiles
 
 from app import config
-from app.a2a.server import PROTOCOL_VERSION, create_a2a_router
+from app.a2a.agent_card import PLANNER_PATH, planner_card
+from app.a2a.server import create_a2a_router
 from app.data.repository import DataLoadError, LiveSource
 from app.planner.agent import PlannerAgent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
-PLANNER_PATH = "/a2a/planner"
-
 log = logging.getLogger(__name__)
 
-try:
-    source = LiveSource.from_config()
-    source.check()  # one-record probe: S43 is read per question, but fail fast if it cannot be reached
-except DataLoadError as exc:
-    # One readable line instead of a long traceback; the server cannot answer without S43.
-    raise SystemExit(f"\nCannot start - S43 could not be reached:\n  {exc}\n") from None
-planner = PlannerAgent(source, config.AGING_THRESHOLD_DAYS)
-if config.LLM_ENABLED:
+
+# ---------------------------------------------------------------- 1. SAP S43 connection
+def connect_to_s43() -> LiveSource:
+    """Open the S43 data source and make one test call, so a wrong URL / password fails at startup."""
+    try:
+        source = LiveSource.from_config()
+        source.check()
+    except DataLoadError as exc:
+        raise SystemExit(f"\nCannot start - S43 could not be reached:\n  {exc}\n") from None
+    return source
+
+
+# ---------------------------------------------------------------- 2. Planner agent
+def build_planner(source: LiveSource) -> PlannerAgent:
+    """Planner agent. With AI Core configured, GPT-4o picks the tools; otherwise the keyword router is used."""
+    planner = PlannerAgent(source, config.AGING_THRESHOLD_DAYS)
+
+    if not config.LLM_ENABLED:
+        log.info("LLM disabled (AICORE_* not set) - using the rule-based router")
+        return planner
+
     from app.llm.aicore import AICoreChat
     from app.planner.llm_planner import LLMPlanner
-    planner.llm = LLMPlanner(planner, AICoreChat(
+
+    chat = AICoreChat(
         config.AICORE_AUTH_URL, config.AICORE_CLIENT_ID, config.AICORE_CLIENT_SECRET, config.AICORE_BASE_URL,
-        config.LLM_DEPLOYMENT_ID, config.AICORE_RESOURCE_GROUP, config.LLM_TIMEOUT_SECONDS),
-        history_turns=config.LLM_HISTORY_TURNS)
+        config.LLM_DEPLOYMENT_ID, config.AICORE_RESOURCE_GROUP, config.LLM_TIMEOUT_SECONDS)
+    planner.llm = LLMPlanner(planner, chat, history_turns=config.LLM_HISTORY_TURNS)
     log.info("LLM enabled: AI Core deployment %s", config.LLM_DEPLOYMENT_ID)
-else:
-    log.info("LLM disabled (AICORE_* not set) - using the rule-based router")
+    return planner
 
 
-def planner_card() -> dict:
-    return {
-        "protocolVersion": PROTOCOL_VERSION,
-        "name": "Planner Agent - Smart Material AI Chat",
-        "description": (
-            f"Answers planner questions for {config.SITE_NAME} (plant {config.PLANT}): work order material "
-            f"shortage with root cause, aged material (> {config.AGING_THRESHOLD_DAYS} days), over-issued WIP "
-            "incl. Z67/Z68 adjustments, production order status, material master and inventory. "
-            "Business rules are deterministic; every answer carries a data-as-of timestamp."
-        ),
-        "url": config.PUBLIC_BASE_URL + PLANNER_PATH,
-        "preferredTransport": "JSONRPC",
-        "version": "1.0.0",
-        "provider": {"organization": "Sierra Digital Inc.", "url": "https://www.sierradigitalinc.com"},
-        "capabilities": {"streaming": True, "pushNotifications": False, "stateTransitionHistory": False},
-        "defaultInputModes": ["text/plain", "application/json"],
-        "defaultOutputModes": ["text/plain", "application/json", "text/csv",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
-        "skills": [
-            {"id": "work_order_shortage", "name": "Work order shortage",
-             "description": "Shortage status per component for a work order with root cause, aged stock, "
-                            "over-issued WIP and Z67/Z68 adjustments. Params: workOrder.",
-             "tags": ["shortage", "work order", "aging", "over-issue"],
-             "examples": ["What is short for work order 121060001, and what is aged?"]},
-            {"id": "shortage_overview", "name": "Shortage overview",
-             "description": "All work orders with missing parts. Filters: mrpController, orderType, material.",
-             "tags": ["shortage"], "examples": ["Which work orders are short for MRP controller ZMA?"]},
-            {"id": "aged_materials", "name": "Aged materials",
-             "description": f"Stock with aging days > {config.AGING_THRESHOLD_DAYS}. Filters: material, storageLocation.",
-             "tags": ["aging", "inventory"], "examples": ["Show aged material in A301"]},
-            {"id": "over_issued", "name": "Over-issued WIP",
-             "description": "Components issued beyond theoretical requirement, classified using Z67/Z68 adjustments.",
-             "tags": ["over-issue", "WIP", "Z67", "Z68"], "examples": ["Any over-issued materials?"]},
-            {"id": "material_status", "name": "Line-side control status",
-             "description": "Available-to-issue = unrestricted - controlled remaining issue; flags over-control "
-                            "and non-controlled material.",
-             "tags": ["over-control", "non-controlled"], "examples": ["Show non-controlled material in A201"]},
-            {"id": "production_order", "name": "Production order",
-             "description": "Production order header, status, operations and components. Params: workOrder.",
-             "tags": ["production order"], "examples": ["Production order status 121060010"]},
-            {"id": "material_report", "name": "Material master & inventory",
-             "description": "Material master data, stock by storage location with aging, and work-order demand.",
-             "tags": ["material master", "inventory"], "examples": ["Where is material MTINS29300 and how much is available?"]},
-            {"id": "machine_head_review", "name": "Machine-head review",
-             "description": "Candidate machine-head material lines - always marked 'needs review'.",
-             "tags": ["machine-head", "review"], "examples": ["Show machine-head material needing review"]},
-            # Excel-based S43 reports (SMC_OData_V4_URLs.xlsx)
-            {"id": "stock_list", "name": "Stock list (aged inventory export)",
-             "description": "Z_AGEDINV4 stock per storage location and material with aging and all stock categories. "
-                            "Filters: material, storageLocation.",
-             "tags": ["inventory", "aging"], "examples": ["Show the stock list for A201"]},
-            {"id": "issuable_stock", "name": "WIP issuable list",
-             "description": "SME WIP issuable list: stock vs. controlled quantity still to issue (AV / OC / NC), "
-                            "incl. over-control, put-away pending and '-S' views.",
-             "tags": ["issuable", "over-control", "putaway"], "examples": ["Which stock is waiting for put-away?"]},
-            {"id": "wo_component_remaining", "name": "Work-order components remaining",
-             "description": "Z_AGEDINV4 sheet 2: BOM quantity, usage and remaining quantity per order component. "
-                            "Params: workOrder, material, storageLocation, mrpController, orderType.",
-             "tags": ["work order", "components"], "examples": ["Remaining quantity to issue for order 121040317"]},
-            {"id": "component_issuance_14c", "name": "14C component issuance",
-             "description": "PP-GP-014C-NSU: issued (CO11N / other) vs. BOM quantity per order component.",
-             "tags": ["14C", "issuance"], "examples": ["Show the 14C issuance for order 120921757"]},
-            {"id": "issuance_summary_14c", "name": "14C need vs. stock",
-             "description": "PP-GP-014C-NSU summary: need, stock and issuable per storage location and material.",
-             "tags": ["14C", "issuable"], "examples": ["14C summary for A201"]},
-            {"id": "order_master", "name": "PP134 order master",
-             "description": "PP-1341_1 order master: order type, issuance location, material, MRP controller, "
-                            "order/yield/scrap quantity, dates and work center. "
-                            "Params: workOrder, material, storageLocation, mrpController, orderType.",
-             "tags": ["PP134", "order master"], "examples": ["Show the PP134 order master for MRP controller ZDD"]},
-            {"id": "order_user_status", "name": "COOIS user status",
-             "description": "User status per work order (NMVT = excluded from the material checks).",
-             "tags": ["COOIS", "NMVT"], "examples": ["Which orders have user status NMVT?"]},
-        ],
-    }
+# ---------------------------------------------------------------- 3. Web app (API only)
+def create_app(source: LiveSource, planner: PlannerAgent) -> FastAPI:
+    """FastAPI app: the A2A endpoint of the Planner agent and a health check. No UI (see frontend/)."""
+    app = FastAPI(title="Smart Material AI Chat - A2A Agents", version="1.0.0")
+
+    # The frontend is deployed separately, so allow calls from other origins.
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+
+    # POST /a2a/planner (JSON-RPC) and GET /a2a/planner/.well-known/agent-card.json
+    app.include_router(create_a2a_router(PLANNER_PATH, planner_card(), planner.handle))
+
+    @app.get("/health")
+    def health() -> dict:
+        return {
+            "status": "ok",
+            "agents": [PLANNER_PATH],
+            "dataSource": f"Live SAP S43 ({source.odata.service_name}), read per question",
+        }
+
+    return app
 
 
-app = FastAPI(title="Smart Material AI Chat - A2A Agents", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
-app.include_router(create_a2a_router(PLANNER_PATH, planner_card(), planner.handle))
-
-
-@app.middleware("http")
-async def no_stale_ui(request, call_next):
-    """Browsers must revalidate the chat UI files, so a redeploy is picked up without a hard refresh."""
-    response = await call_next(request)
-    if request.url.path == "/" or request.url.path.startswith("/ui"):
-        response.headers["Cache-Control"] = "no-cache"
-    return response
-
-
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok", "agents": [PLANNER_PATH], "dataSource": f"Live SAP S43 ({source.odata.service_name}), read per question"}
-
-
-# Chat UI (frontend/) served at /ui
-FRONTEND_DIR = config.PROJECT_ROOT / "frontend"
-if FRONTEND_DIR.exists():
-    app.mount("/ui", StaticFiles(directory=FRONTEND_DIR, html=True), name="ui")
-
-    @app.get("/", include_in_schema=False)
-    def root() -> RedirectResponse:
-        return RedirectResponse("/ui/")
+# ---------------------------------------------------------------- startup
+_source = connect_to_s43()
+app = create_app(_source, build_planner(_source))

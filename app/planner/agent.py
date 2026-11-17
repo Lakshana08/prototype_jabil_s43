@@ -13,7 +13,7 @@ from openpyxl.utils import get_column_letter
 
 from app.data.repository import LiveSource, begin_request
 from app.llm.aicore import LLMError
-from app.planner import intents, rules
+from app.planner import intents, paging, rules
 from app.planner.live import LiveService
 from app.planner.service import Section
 
@@ -136,7 +136,7 @@ class PlannerAgent:
                 answer, sections, query, calls = self.llm.answer(text, context_id)
                 if structured:
                     _merge_structured(query, structured, self.source)
-                return self._reply(answer, sections, query, llm_calls=calls)
+                return self._reply(answer, sections, query, text, llm_calls=calls)
             except LLMError:
                 log.exception("LLM unavailable - answering with the rule-based router")
                 llm_failed = True
@@ -148,11 +148,11 @@ class PlannerAgent:
         if query.unknown_orders:
             body = (f"Work order(s) {', '.join(query.unknown_orders)} not found in the production order universe.\n\n"
                     + body)
-        reply = self._reply(body, sections, query)
+        reply = self._reply(body, sections, query, text)
         reply.data["llmFallback"] = llm_failed
         return reply
 
-    def _reply(self, body: str, sections: list[Section], query: intents.ParsedQuery,
+    def _reply(self, body: str, sections: list[Section], query: intents.ParsedQuery, question: str = "",
                llm_calls: list[dict] | None = None) -> AgentReply:
         provenance = self.source.provenance()
         footer = (f"\n\n_Data as of {provenance['dataAsOf']} - {provenance['dataSource']}. "
@@ -175,16 +175,20 @@ class PlannerAgent:
         if files:
             footer += f"\n\n_Attached: {', '.join(n for n, _, _ in files)}._"
 
+        tool_results = [_tool_result(s, question) for s in sections]
+        next_page = page.get("next_page_prompt") if page else None
+        reports = next((_report_prompts(question) for s in sections if s.rows), {})
         data = {
-            "agent": self.name,
-            "query": query.as_dict(),
-            "results": [{"skill": s.skill, "title": s.title, "resultType": s.result_type, "severity": s.severity,
-                         "headline": s.headline, "actions": s.actions, "rowCount": len(s.rows), "data": s.data}
-                        for s in sections],
+            # What the caller can offer next: "next_page" (more rows), "reports_only" (Excel/CSV), or "none".
+            "followup": "next_page" if next_page else "reports_only" if reports else "none",
+            "tool_results": tool_results,
             # Flat, top level: the UI's "Show next 20" button only needs this one value (null on the last page).
-            "next_page_prompt": page.get("next_page_prompt") if page else None,
+            "next_page_prompt": next_page,
+            **reports,
             "trace": self._trace(query, sections, provenance, llm_calls),
             "answeredBy": "llm" if llm_calls is not None else "rules",
+            "agent": self.name,
+            "query": query.as_dict(),
             **provenance,
         }
         log.info("planner answeredBy=%s skills=%s entities=%s", data["answeredBy"],
@@ -413,6 +417,40 @@ _ARG_LABELS = {
     "view": "list", "statuses": "status", "components": "components", "min_aging_days": "aged at least (days)",
     "excluded_only": "excluded only",
 }
+
+
+def _tool_result(s: Section, question: str) -> dict:
+    """One skill's result for the A2A data part: the shown page of rows plus paging and report prompts."""
+    rows = paging.page_slice(s.rows, s.skip)
+    meta = paging.page_meta(len(s.rows), s.skip, len(rows))
+    out = {
+        "skill": s.skill,
+        "title": s.title,
+        "resultType": s.result_type,
+        "severity": s.severity,
+        "headline": s.headline,
+        "actions": s.actions,
+        "truncated": meta["has_more"],
+        "has_more": meta["has_more"],
+        "skip": meta["skip"],
+        "count": meta["count"],
+        "returned": meta["returned"],
+        "results": rows,
+        "next_page_prompt": s.next_page_prompt,
+    }
+    if s.data:
+        out["details"] = s.data  # nested business result (e.g. order header + components)
+    if s.rows:
+        out.update(_report_prompts(question))
+    return out
+
+
+def _report_prompts(question: str) -> dict:
+    """Follow-up texts that ask for the same answer as a file (Excel / CSV)."""
+    # The file always holds every row, so drop a "rows 21-40" page range from the question.
+    q = paging.strip_row_range(question or "").strip().rstrip("?.!,") or "this answer"
+    return {"report_prompt_excel": f"Generate a report for: {q} - in Excel format",
+            "report_prompt_csv": f"Generate a report for: {q} - in CSV format"}
 
 
 def _describe_call(call: dict) -> str:

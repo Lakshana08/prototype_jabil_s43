@@ -33,6 +33,9 @@ class Section:
     severity: str = "info"
     # Storage-location code -> name, from the data this answer was built on (warehouse vs. line-side).
     location_names: dict = field(default_factory=dict)
+    # Page of ``rows`` this answer shows (first row index) and the follow-up text for the next page.
+    skip: int = 0
+    next_page_prompt: str | None = None
 
 
 class PlannerService:

@@ -21,6 +21,11 @@ def skip_from_text(text: str | None) -> int | None:
     return max(0, int(m.group(1)) - 1) if m else None
 
 
+def strip_row_range(text: str) -> str:
+    """'Show the stock list for A201, rows 21-40' -> 'Show the stock list for A201'."""
+    return re.sub(r"[,\s]*" + _ROWS_RE.pattern, "", text, flags=re.IGNORECASE)
+
+
 def resolve_skip(model_skip, requested_skip: int | None) -> int:
     """The model's non-zero value wins; otherwise the page parsed from the user's text."""
     try:
