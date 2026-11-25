@@ -1,9 +1,27 @@
-"""Planner query service.
+"""Planner skills: apply the business rules (rules.py) to the data of ONE question.
 
-Each public method answers one planner question type and returns a ``Section``:
-a markdown narration for the chat, a structured payload for the caller, and flat
-rows for CSV export. All numbers come from the repository + ``rules``; nothing is
-estimated.
+How a question is answered:
+
+    question -> LiveService (live.py) -> LiveSource.for_*  (data/repository.py: OData reads from S43)
+             -> PlannerService.<skill> (this file: apply rules.py, then build the answer)
+             -> Section (headline + table + rows for CSV)  -> LLM / template words the reply
+
+    Skill                 Loader (repository.py)   Rules used (rules.py)                    Data (S43)
+    --------------------  -----------------------  ---------------------------------------  ----------------------------
+    material_status       for_material_status      classify_positions / material_status    Sheet1 stock, Sheet2 lookup,
+                                                   (6.1, 6.2) + z67_z68_adjustment          Sheet3 (verification)
+    aged_materials        for_aged                 is_aged (6.3)                            Sheet1 stock, Sheet3
+    machine_head_review   for_machine_head         needs_machine_head_review (6.4)          WorkOrderShortage
+    work_order_shortage   for_order                is_short, shortage_root_cause,           WorkOrderShortage,
+                                                   over_issued_qty, is_aged, 6.4 flag       ProductionOrder, Inventory
+    shortage_overview     for_shortage             is_short                                 WorkOrderShortage
+    over_issued           for_over_issued          over_issued_qty, classify_over_issue     WorkOrderShortage
+    production_order      for_production_order     -                                        ProductionOrder
+    material_report       for_material             material_status, is_aged                 MaterialMaster, Inventory
+                                                                                            (or Sheet1 + Sheet2)
+
+Every method follows the same order: 1. calculate (rules) -> 2. verify where S43 has its own
+result -> 3. present (sort, headline, actions, markdown table). Nothing is estimated.
 """
 from __future__ import annotations
 
@@ -13,6 +31,9 @@ from dataclasses import dataclass, field
 from app.data.repository import DataRepository, nav
 from app.planner import rules
 from app.planner.rules import fmt
+
+# ExcludeReason values S43 applies for rules that spec 6.5 says NOT to implement yet (SME open questions #1, #2).
+SPEC_6_5_PENDING = {"Bulk material", "Dummy part (-S)"}
 
 MAX_TABLE_ROWS = 25  # chat tables are truncated; CSV export carries everything
 
@@ -50,8 +71,12 @@ class PlannerService:
         (ExcludeReason empty) - the lookup table behind spec §6.1/§6.2."""
         req: dict[tuple[str, str], float] = defaultdict(float)
         for c in self.repo.all_components():
-            if not c.get("ExcludeReason") and c.get("StorageLocation"):
-                req[(c["StorageLocation"], c["Material"].upper())] += c.get("ControlledRemainingIssueQty") or 0
+            reason = c.get("ExcludeReason") or ""
+            if not c.get("StorageLocation") or (reason and reason not in SPEC_6_5_PENDING):
+                continue
+            # Spec 6.5: bulk / -S exclusions are not confirmed - such components still count as controlled.
+            qty = c.get("RemainingIssueQty") if reason else c.get("ControlledRemainingIssueQty")
+            req[(c["StorageLocation"], c["Material"].upper())] += qty or 0
         return dict(req)
 
     def _aged_stock(self, material: str) -> list[dict]:
@@ -86,7 +111,7 @@ class PlannerService:
             "isShort": rules.is_short(c),
             "overIssuedQty": rules.over_issued_qty(c),
             "overIssueClass": rules.classify_over_issue(c),
-            "z67z68Adjustment": rules.z67_z68_adjustment(c),
+            "z67z68Adjustment": rules.z67_z68_adjustment(c.get("NetGI_Other")),
             "isAged": bool(aged),
             "agedStock": aged,
             "needsReview": rules.needs_machine_head_review(order_type, c),
@@ -333,15 +358,21 @@ class PlannerService:
                        severity="critical" if exp_orders else "warning" if rows else "ok")
 
     def aged_materials(self, materials: set[str] = frozenset(), slocs: set[str] = frozenset()) -> Section:
-        rows = []
+        rows, not_aged = [], []
         for i in self.repo.inventory:
-            if not rules.is_aged(i.get("AgingDays"), self.aging_threshold):
-                continue
             if materials and i["Material"].upper() not in materials:
                 continue
             if slocs and i["StorageLocation"] not in slocs:
                 continue
-            demand = self._controlled_requirement.get((i["StorageLocation"], i["Material"].upper()))
+            if not rules.is_aged(i.get("AgingDays"), self.aging_threshold):
+                if materials:  # a named material: also report its positions that are NOT aged
+                    not_aged.append({"Material": i["Material"], "StorageLocation": i["StorageLocation"],
+                                     "AgingDays": i.get("AgingDays"), "Unrestricted": i.get("Unrestricted"),
+                                     "BaseUnit": i.get("BaseUnit")})
+                continue
+            # Sheet3 controlled remaining (stock-list source) or the shortage-view demand (planner source).
+            demand = (i["ControlledRemainingQty"] if "ControlledRemainingQty" in i
+                      else self._controlled_requirement.get((i["StorageLocation"], i["Material"].upper())))
             rows.append({
                 "Material": i["Material"], "Description": i.get("ProductDescription"),
                 "StorageLocation": i["StorageLocation"],
@@ -397,12 +428,26 @@ class PlannerService:
                 para.append(("All of them are" if not no_demand else
                              f"The other {_plural(needed, 'item')} {'is' if needed == 1 else 'are'}")
                             + " still needed by open work orders and should be used before newer stock.")
+            if materials:
+                para.insert(0, f"Yes - {_names(sorted({r['Material'] for r in rows}))} "
+                               f"{'is' if len({r['Material'] for r in rows}) == 1 else 'are'} flagged as aged inventory.")
             headline = " ".join(para)
+        elif materials and not_aged:
+            where = ", ".join(f"{r['StorageLocation']} {r['AgingDays']} days ({fmt(r['Unrestricted'])} {r['BaseUnit']})"
+                              for r in sorted(not_aged, key=lambda r: -(r["AgingDays"] or 0)))
+            headline = (f"No - {_names(sorted(materials))} is not flagged as aged inventory: its stock is not older "
+                        f"than the {self.aging_threshold}-day threshold ({where}).")
+        elif materials:
+            headline = f"No - there is no stock of {_names(sorted(materials))}, so nothing is aged."
         else:
             headline = f"Good news: there is no stock{scope} older than {self.aging_threshold} days."
+        if not_aged:
+            lines += ["", f"_Not aged (<= {self.aging_threshold} days): "
+                      + ", ".join(f"{r['Material']} in {r['StorageLocation']} {r['AgingDays']} days" for r in not_aged) + "._"]
         return Section("aged_materials", "Aged materials", "\n".join(lines),
                        data={"thresholdDays": self.aging_threshold, "filters": _filters(materials=materials, slocs=slocs),
-                             "totalValue": total_value, "currency": currency, "positions": rows},
+                             "totalValue": total_value, "currency": currency, "positions": rows,
+                             "notAgedPositions": not_aged},
                        rows=rows,
                        headline=headline,
                        actions=actions or ["No action needed."],
@@ -422,7 +467,7 @@ class PlannerService:
                 qty = rules.over_issued_qty(c)
                 if qty <= 0:
                     continue
-                adj = rules.z67_z68_adjustment(c)
+                adj = rules.z67_z68_adjustment(c.get("NetGI_Other"))
                 rows.append({
                     "WorkOrder": wo["ManufacturingOrder"], "OrderType": wo["ManufacturingOrderType"],
                     "OrderStatus": wo.get("OrderStatus"), "MRPController": wo.get("MRPController"),
@@ -478,79 +523,88 @@ class PlannerService:
 
     def material_status(self, materials: set[str] = frozenset(), slocs: set[str] = frozenset(),
                         status_filter: str | None = None) -> Section:
-        """Line-side issuable / over-control / non-controlled check (spec §6.1-6.2, Z_AGEDINV logic)."""
-        stock: dict[tuple[str, str], dict] = {}
-        for i in self.repo.inventory:
-            if not self.repo.is_line_side(i["StorageLocation"]):
-                continue
-            key = (i["StorageLocation"], i["Material"].upper())
-            agg = stock.setdefault(key, {"Material": i["Material"], "Description": i.get("ProductDescription"),
-                                         "StorageLocation": i["StorageLocation"], "BaseUnit": i.get("BaseUnit"),
-                                         "Unrestricted": 0.0, "AgingDays": i.get("AgingDays")})
-            agg["Unrestricted"] = round(agg["Unrestricted"] + (i.get("Unrestricted") or 0)
-                                        + (i.get("UnrestrictedConsignment") or 0), 3)
-            agg["AgingDays"] = max(agg["AgingDays"] or 0, i.get("AgingDays") or 0)
+        """Spec 6.1 / 6.2 - non-controlled / over-control / available to issue per SLoc + material.
 
+        Inputs (loaded by LiveSource.for_material_status): stock = Z_AGEDINV stock list,
+        controlled_lookup = Z_AGEDINV sheet 2, z67z68 = Net GI (Other), cds_status = S43's own result."""
+        # 1. CALCULATE - the rule itself lives in rules.classify_positions / rules.material_status
+        stock = [i for i in self.repo.inventory
+                 if (not materials or i["Material"].upper() in materials)
+                 and (not slocs or i["StorageLocation"] in slocs)]
+        positions = rules.classify_positions(stock, self.repo.controlled_lookup or {}, self.repo.z67z68)
+        if status_filter:
+            positions = [p for p in positions if p["Status"] == status_filter]
+
+        # 2. VERIFY - compare each position with the status S43 calculated in CDS (Sheet3_WIPIssuable)
         rows = []
-        for key, agg in sorted(stock.items()):
-            if materials and key[1] not in materials:
-                continue
-            if slocs and key[0] not in slocs:
-                continue
-            req = self._controlled_requirement.get(key)
-            status, available = rules.material_status(agg["Unrestricted"], req)
-            if status_filter and status != status_filter:
-                continue
-            rows.append({**agg, "ControlledRemainingIssueQty": round(req, 3) if req is not None else None,
-                         "AvailableToIssueQty": available, "Status": status,
-                         "IsAged": rules.is_aged(agg["AgingDays"], self.aging_threshold)})
+        for p in positions:
+            cds = self.repo.cds_status.get(p.pop("Key"))
+            rows.append({**p, "S43Status": cds, "MatchesS43": cds is None or cds == p["StatusCode"]})
+
+        # 3. PRESENT - most urgent first: over-control (largest deficit), non-controlled (oldest), available
+        rank = {rules.STATUS_OVER_CONTROL: 0, rules.STATUS_NON_CONTROLLED: 1, rules.STATUS_AVAILABLE: 2}
+        rows.sort(key=lambda r: (rank[r["Status"]], r["AvailableToIssueQty"] or 0, -(r["AgingDays"] or 0)))
 
         counts = defaultdict(int)
         for r in rows:
             counts[r["Status"]] += 1
+        mismatches = [r for r in rows if not r["MatchesS43"]]
+        explained = [r for r in rows if r["Z67Z68Adjustment"] and r["Z67Z68Adjustment"] > 0]
         filt = _filter_text(materials=materials, slocs=slocs)
-        lines = [f"**Line-side material status** ({len(rows)} SLoc/material positions){filt}: "
+        lines = [f"**Material control status** ({len(rows)} SLoc/material positions){filt}: "
                  + ", ".join(f"{v} {k}" for k, v in counts.items()), "",
-                 "_Rule: Available = Unrestricted - Controlled remaining issue; < 0 = over-control; "
-                 "no open controlled requirement = non-controlled._", ""]
+                 "_Rule (spec 6.1/6.2): Available = Unrestricted - Controlled remaining issuance (lookup by SLoc + "
+                 "material in Z_AGEDINV sheet 2); no match = non-controlled; < 0 = over-control._",
+                 f"_Checked against S43 CDS (Sheet3_WIPIssuable): {len(rows) - len(mismatches)} of {len(rows)} "
+                 "positions match._", ""]
         lines += _md_table(
-            ["SLoc", "Material", "Description", "Unrestricted", "Ctrl remaining", "Available", "Status", "Aging"],
+            ["SLoc", "Material", "Description", "Unrestricted", "Ctrl remaining", "Available", "Status", "Z67/Z68", "Aging"],
             [[r["StorageLocation"], r["Material"], r["Description"], fmt(r["Unrestricted"]),
               fmt(r["ControlledRemainingIssueQty"]), fmt(r["AvailableToIssueQty"]), r["Status"],
-              r["AgingDays"]] for r in rows])
+              r["Z67Z68Context"] or "", r["AgingDays"]] for r in rows])
         n_over = counts.get(rules.STATUS_OVER_CONTROL, 0)
         n_non = counts.get(rules.STATUS_NON_CONTROLLED, 0)
         n_ok = counts.get(rules.STATUS_AVAILABLE, 0)
         actions = []
         if n_over:
-            actions.append(f"{n_over} position(s) are over-control: open work orders need more than the line-side stock - "
-                           "do not issue more without checking the order requirement.")
+            actions.append(f"{n_over} position(s) are over-control: open work orders still need more than the stock "
+                           "on hand - check the order requirement before issuing more"
+                           + (f"; {len(explained)} of them have a Z67/Z68 adjust-in that may explain it."
+                              if explained else "."))
         if n_non:
-            actions.append(f"{n_non} position(s) are non-controlled: stock on the line with no open work order - "
-                           "consider returning it to the warehouse.")
+            actions.append(f"{n_non} position(s) are non-controlled: no open work-order requirement for this storage "
+                           "location + material.")
         if n_ok:
             actions.append(f"{n_ok} position(s) can still be issued within the controlled allowance.")
+        if mismatches:
+            actions.append(f"{len(mismatches)} position(s) differ from the S43 CDS result - check the source data.")
         scope = _scope(materials=materials, slocs=slocs)
         if rows:
-            para = [f"I checked {_plural(len(rows), 'stock item')} on the production line{scope}."]
-            if n_ok:
-                para.append(f"{_plural(n_ok, 'item')} can still be issued to work orders within the planned quantity.")
+            para = [f"I checked {_plural(len(rows), 'stock position')}{scope} "
+                    f"({', '.join(f'{v} {k.lower()}' for k, v in counts.items())})."]
             if n_over:
-                para.append(f"{_plural(n_over, 'item')} {'has' if n_over == 1 else 'have'} less stock on the line than "
-                            f"open work orders still need, so check the order requirement before issuing more.")
+                para.append(f"{_plural(n_over, 'position')} {'has' if n_over == 1 else 'have'} less stock than open "
+                            "work orders still need, so check the order requirement before issuing more"
+                            + (f" ({len(explained)} with a Z67/Z68 adjust-in that may explain it)."
+                               if explained else "."))
             if n_non:
-                para.append(f"{_plural(n_non, 'item')} {'is' if n_non == 1 else 'are'} sitting on the line with no open "
-                            f"work order and could be returned to the warehouse.")
+                para.append(f"{_plural(n_non, 'position')} {'has' if n_non == 1 else 'have'} no open work-order "
+                            "requirement (non-controlled).")
+            if n_ok:
+                para.append(f"{_plural(n_ok, 'position')} can still be issued within the planned quantity.")
             headline = " ".join(para)
         else:
-            headline = f"There is no stock on the production line{scope}."
-        return Section("material_status", "Production line stock status", "\n".join(lines),
+            headline = f"There is no stock{scope}."
+        return Section("material_status", "Material control status", "\n".join(lines),
                        data={"filters": _filters(materials=materials, slocs=slocs), "counts": dict(counts),
-                             "positions": rows},
+                             "rule": "spec 6.1/6.2", "matchesS43": len(rows) - len(mismatches),
+                             "mismatchesS43": [{k: r[k] for k in ("StorageLocation", "Material", "StatusCode", "S43Status")}
+                                               for r in mismatches[:20]],
+                             "z67z68Explained": len(explained)},
                        rows=rows,
                        headline=headline,
                        actions=actions or ["No action needed."],
-                       severity="warning" if n_over or n_non else "ok")
+                       severity="warning" if n_over or mismatches else "ok")
 
     def production_order(self, order: str) -> Section:
         po = self.repo.production_order_by_order.get(order)
@@ -656,8 +710,13 @@ class PlannerService:
         }
         positions = []
         for i in sorted(stock, key=lambda x: x["StorageLocation"]):
-            req = self._controlled_requirement.get((i["StorageLocation"], key))
-            status = rules.material_status(i.get("Unrestricted") or 0, req)[0] if self.repo.is_line_side(i["StorageLocation"]) else "Warehouse stock"
+            if self.repo.controlled_lookup is not None:  # Z_AGEDINV stock: spec 6.1 lookup, every location
+                req = self.repo.controlled_lookup.get(rules.lookup_key(i["StorageLocation"], key))
+                status = rules.material_status(i.get("Unrestricted") or 0, req)[0]
+            else:
+                req = self._controlled_requirement.get((i["StorageLocation"], key))
+                status = (rules.material_status(i.get("Unrestricted") or 0, req)[0]
+                          if self.repo.is_line_side(i["StorageLocation"]) else "Warehouse stock")
             positions.append({
                 "storageLocation": i["StorageLocation"],
                 "storageLocationName": self.repo.storage_location_names.get(i["StorageLocation"], ""),

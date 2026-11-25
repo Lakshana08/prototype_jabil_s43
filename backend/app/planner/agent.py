@@ -143,9 +143,17 @@ class PlannerAgent:
 
         query = intents.parse(text or "", self.source)
         _merge_structured(query, structured, self.source)
+        if query.unknown_keys and not (query.materials or query.storage_locations or query.work_orders
+                                       or query.unknown_orders or structured.get("skill")):
+            # Never answer "is X aged?" for an unknown X with a plant-wide list.
+            body = f"{', '.join(query.unknown_keys)} not found in S43 - please check the material number."
+            reply = self._reply(body, [], query, text)
+            reply.data["llmFallback"] = llm_failed
+            return reply
         sections = self._route(query, structured.get("skill"))
         body = "\n\n---\n\n".join(f"### {s.title}\n{_summary_md(s)}{s.text}" for s in sections)
-        if query.unknown_orders:
+        # Report sheets (PP134, 14C, sheet 2, COOIS) have their own, larger order set.
+        if query.unknown_orders and not any(s.skill in REPORT_SKILLS and s.rows for s in sections):
             body = (f"Work order(s) {', '.join(query.unknown_orders)} not found in the production order universe.\n\n"
                     + body)
         reply = self._reply(body, sections, query, text)
@@ -318,7 +326,8 @@ class PlannerAgent:
         if "over_issued" in intents_:
             sections.append(svc.over_issued(orders, mrp, types, mats))
         if "material_status" in intents_:
-            sections.append(svc.material_status(mats, slocs, _status_filter(q.text)))
+            # A named material is a yes/no question: show every location, not only the asked status.
+            sections.append(svc.material_status(mats, slocs, None if mats else _status_filter(q.text)))
         if "machine_head" in intents_:
             sections.append(svc.machine_head_review())
         sections += report_sections
@@ -339,14 +348,16 @@ class PlannerAgent:
         orders = set(q.work_orders) | set(q.unknown_orders)
         mrp, types = set(q.mrp_controllers), set(q.order_types)
         out: list[Section] = []
+        code = {rules.STATUS_NON_CONTROLLED: "NC", rules.STATUS_OVER_CONTROL: "OC"}.get(_status_filter(q.text))
+        statuses = [code] if code else []
         if "stock_list" in intents_:
             out.append(svc.stock_list(mats, slocs))
         if "putaway" in intents_:
-            out.append(svc.issuable_stock("putaway_pending", mats, slocs))
+            out.append(svc.issuable_stock("putaway_pending", mats, slocs, statuses))
         if "suffix_s" in intents_:
-            out.append(svc.issuable_stock("suffix_s", mats, slocs))
+            out.append(svc.issuable_stock("suffix_s", mats, slocs, statuses))
         if "wip_issuable" in intents_:
-            out.append(svc.issuable_stock("all", mats, slocs))
+            out.append(svc.issuable_stock("all", mats, slocs, statuses))
         if "user_status" in intents_:
             out.append(svc.order_user_status(orders))
         if "order_master" in intents_:
@@ -495,13 +506,16 @@ def _summary_md(s: Section) -> str:
 
 def _status_filter(text: str) -> str | None:
     low = (text or "").lower()
-    if any(w in low for w in ["non-controlled", "non controlled", "uncontrolled"]):
+    if any(w in low for w in ["non-controlled", "non controlled", "uncontrolled", "un controlled",
+                              "un-controlled", "无管制"]):
         return rules.STATUS_NON_CONTROLLED
-    if any(w in low for w in ["over-control", "over control", "overcontrol"]):
+    if any(w in low for w in ["over-control", "over control", "overcontrol", "领超管制", "超领管制"]):
         return rules.STATUS_OVER_CONTROL
     return None
 
 
+REPORT_SKILLS = {"stock_list", "issuable_stock", "wo_component_remaining", "component_issuance_14c",
+                 "issuance_summary_14c", "order_user_status", "order_master"}
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 

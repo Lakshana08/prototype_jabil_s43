@@ -51,7 +51,10 @@ SAP_ODATA_SERVICE_PATH = os.getenv("SAP_ODATA_SERVICE_PATH", SERVICE_PATH)
 
 # Aging threshold in days. Default 14 (global KPI); changed only by an authorized administrator
 # through configuration, never by the end user in chat.
-AGING_THRESHOLD_DAYS = int(os.getenv("AGING_THRESHOLD_DAYS", "14"))
+AGING_THRESHOLD_DAYS = 14  # spec §6.3: fixed global threshold - AGING_THRESHOLD_DAYS in the environment is ignored
+if os.getenv("AGING_THRESHOLD_DAYS", "14").strip() != "14":
+    import logging
+    logging.getLogger(__name__).warning("AGING_THRESHOLD_DAYS is ignored: spec 6.3 fixes the aging threshold at 14 days")
 
 # Public base URL advertised in the A2A agent card.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")

@@ -16,7 +16,8 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
     "over_issued": ["over-issue", "over issue", "overissue", "over-issued", "over issued", "excess issue",
                     "z67", "z68"],
     "material_status": ["over-control", "over control", "overcontrol", "non-controlled", "non controlled",
-                        "uncontrolled", "issuable", "available to issue", "control status"],
+                        "uncontrolled", "un controlled", "un-controlled", "无管制", "领超管制", "超领管制",
+                        "issuable", "available to issue", "control status"],
     "production_order": ["production order", "order status", "order detail", "work order detail", "operations",
                          "confirmation", "progress"],
     "material": ["material master", "mrp type", "procurement", "lead time", "where is", "how much",
@@ -26,7 +27,7 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
     "stock_list": ["stock list", "inventory export", "aged inventory export", "z_agedinv", "agedinv"],
     "wip_issuable": ["wip issuable", "wip-issuable", "issuable list", "可发料", "可发量"],
     "putaway": ["putaway", "put-away", "put away", "待入库"],
-    "suffix_s": ["-s material", "suffix", "ending in -s", "ends with -s"],
+    "suffix_s": ["-s material", "suffix", "ending in -s", "ends with -s", "ending with -s", "end with -s"],
     "user_status": ["user status", "coois", "nmvt", "excluded order"],
     "issuance_14c": ["14c"],
     "order_master": ["pp134", "pp-134", "pp 134", "order master"],
@@ -47,6 +48,7 @@ class ParsedQuery:
     intents: list[str] = field(default_factory=list)
     work_orders: list[str] = field(default_factory=list)
     unknown_orders: list[str] = field(default_factory=list)
+    unknown_keys: list[str] = field(default_factory=list)  # material-like keys that do not exist in S43
     materials: list[str] = field(default_factory=list)
     storage_locations: list[str] = field(default_factory=list)
     mrp_controllers: list[str] = field(default_factory=list)
@@ -90,9 +92,13 @@ def parse(text: str, source: LiveSource) -> ParsedQuery:
             q.mrp_controllers.append(mrp)  # case-sensitive: avoid matching ordinary words
         elif tok.isupper() and (ot := source.find_order_type(up)) and ot not in q.order_types:
             q.order_types.append(ot)
+        elif len(tok) >= 6 and any(ch.isdigit() for ch in tok) and any(ch.isalpha() for ch in tok):
+            q.unknown_keys.append(up)  # looks like a material number but S43 does not know it
 
+    # Non-controlled / over-control / available-to-issue questions go to material_status (spec 6.1/6.2,
+    # computed on the Z_AGEDINV data and checked against S43); put-away / -S lists stay with the SME sheets.
     # The report lists are more specific than the generic line-side status / inventory questions.
-    if set(q.intents) & {"wip_issuable", "putaway", "suffix_s"}:
+    if set(q.intents) & {"wip_issuable", "putaway", "suffix_s", "issuance_14c"}:
         q.intents = [i for i in q.intents if i not in ("material_status", "material")]
     if "stock_list" in q.intents and "material" in q.intents:
         q.intents.remove("material")

@@ -73,11 +73,16 @@ TOOLS = [
           {"work_orders": _arr("Work order numbers"), "mrp_controllers": _arr("MRP controller codes"),
            "order_types": _arr("Order types"), "materials": _arr("Material numbers")}),
     _tool("material_status",
-          "Line-side control status: stock on the production line vs quantity still to issue "
-          "(over-control / non-controlled / issuable).",
+          "Material control status per storage location + material (business rule spec 6.1/6.2, the SME's "
+          "Z_AGEDINV logic, every location of the plant): Available = Unrestricted - Controlled remaining issuance; "
+          "no open work-order requirement = non-controlled / uncontrolled (无管制料), < 0 = over-control (领超管制), "
+          ">= 0 = available to issue (可发量). Over-control rows carry Z67/Z68 adjustment context. Use it for any "
+          "count, list or yes/no question about non-controlled, over-control or available-to-issue material.",
           {"materials": _arr("Material numbers"), "storage_locations": _arr("Storage locations"),
            "status": {"type": "string", "enum": ["over_control", "non_controlled"],
-                      "description": "Only rows with this status"}}),
+                      "description": "Only rows with this status. Use for list/count questions only - for a "
+                                     "yes/no question about a named material leave it out so every location "
+                                     "is returned"}}),
     _tool("material_report",
           "Everything about ONE material: master data (MRP type, procurement, lead time), stock by storage "
           "location and open work-order demand.",
@@ -99,7 +104,9 @@ TOOLS = [
           "controlled quantity still to issue and the quantity available to issue, with status AV (available "
           "to issue), OC (over-control / over-issued) or NC (non-controlled). view: 'all' = the full list, "
           "'over_control' = the over-control sheet, 'putaway_pending' = stock waiting for put-away (receiving "
-          "locations), 'suffix_s' = materials whose number ends in -S.",
+          "locations), 'suffix_s' = materials whose number ends in -S. Use it when the user asks for these SME "
+          "sheets (WIP issuable list, put-away pending, -S list); for plain non-controlled / over-control / "
+          "available counts and lists use material_status.",
           {"view": {"type": "string", "enum": list(ISSUABLE_VIEWS), "description": "Which list; default all"},
            "materials": _arr("Material numbers"), "storage_locations": _arr("Storage locations"),
            "statuses": _arr("Only these status codes", ["AV", "OC", "NC"])}),
@@ -162,6 +169,9 @@ How to answer - clear and to the point for a busy planner:
 - Structure:
   1. First paragraph: ONE sentence that directly answers the question with the key number
      (e.g. "6 of the 12 work orders for MRP controller ZMA are short of material.").
+     A yes/no question ("is X aged?", "is X short?", "is X non-controlled?") starts with "Yes" or "No"
+     and answers only about the item asked - never replace it with a plant-wide list. If the answer differs
+     by storage location, say so per location (e.g. "Yes in A340, but in A341 it is available to issue").
   2. Second paragraph: 1-3 short sentences that explain the situation and its cause, with the most
      important action woven into the text (e.g. "...so supply for it has to be expedited from the
      supplier"). Do not repeat facts from the first sentence.
@@ -215,6 +225,10 @@ Meaning of the result fields:
   controlled quantity still to issue, AvailableToIssue = stock minus still-to-issue (negative = deficit).
 
 Context: today is {today}. Data as of {as_of}. Aged = not used for more than {threshold} days."""
+
+
+class _Unresolved(Exception):
+    """Every key the user named for a filter is unknown in S43."""
 
 
 class LLMPlanner:
@@ -294,6 +308,9 @@ class LLMPlanner:
                     _add(target, hit)
                 else:
                     errors.append(f"{label} {v} not found in S43.")
+            if _as_list(values) and not out:
+                # Never fall back to an unfiltered (plant-wide) answer when every requested key is unknown.
+                raise _Unresolved(" ".join(errors))
             return out
 
         mats = lambda a: keys(a.get("materials"), source.find_material, "Material", q.materials)  # noqa: E731
@@ -303,6 +320,27 @@ class LLMPlanner:
                              "MRP controller", q.mrp_controllers)
         types = lambda a: keys(a.get("order_types"), source.find_order_type, "Order type", q.order_types)  # noqa: E731
 
+        try:
+            section = self._dispatch(name, args, q, sections, svc, source, orders, keys, mats, slocs, mrp, types)
+        except _Unresolved as exc:
+            return {"error": str(exc) + " Say so plainly; do not answer with data for other materials or locations."}
+        if isinstance(section, dict):  # attach_report / unknown tool
+            return section
+        if section is None:
+            return {"error": " ".join(errors) or "Nothing found."}
+        sections.append(section)
+        skip = paging.resolve_skip(args.get("skip"), requested_skip)
+        result = _compact(section, section.location_names, skip)
+        meta = {k: result[k] for k in ("count", "skip", "returned", "has_more")}
+        section.skip = skip
+        section.next_page_prompt = paging.next_page_prompt(_page_subject(name, args), meta)
+        result["_page"] = {**meta, "table": _page_table(name, paging.page_slice(section.rows, skip)),
+                           "next_page_prompt": section.next_page_prompt}
+        if errors:
+            result["warnings"] = errors
+        return result
+
+    def _dispatch(self, name, args, q, sections, svc, source, orders, keys, mats, slocs, mrp, types):
         section: Section | None = None
         if name == "attach_report":
             if not any(sec.rows for sec in sections):
@@ -340,20 +378,7 @@ class LLMPlanner:
             section = self._run_report(name, args, q, svc)
         else:
             return {"error": f"Unknown tool {name}"}
-
-        if section is None:
-            return {"error": " ".join(errors) or "Nothing found."}
-        sections.append(section)
-        skip = paging.resolve_skip(args.get("skip"), requested_skip)
-        result = _compact(section, section.location_names, skip)
-        meta = {k: result[k] for k in ("count", "skip", "returned", "has_more")}
-        section.skip = skip
-        section.next_page_prompt = paging.next_page_prompt(_page_subject(name, args), meta)
-        result["_page"] = {**meta, "table": _page_table(name, paging.page_slice(section.rows, skip)),
-                           "next_page_prompt": section.next_page_prompt}
-        if errors:
-            result["warnings"] = errors
-        return result
+        return section
 
     @staticmethod
     def _run_report(name: str, args: dict, q: intents.ParsedQuery, svc) -> Section:

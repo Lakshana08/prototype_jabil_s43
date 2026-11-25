@@ -21,6 +21,7 @@ from typing import Iterable
 
 from app.data import s4_apis as s4
 from app.data.odata import ODataClient, ODataError, all_of, any_of, eq
+from app.planner import rules
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +84,10 @@ class DataRepository:
     # Component lines read without their work order (open demand for a stock position).
     demand_components: list[dict] = field(default_factory=list)
     order_range: tuple[str, str] | None = None  # valid order numbers, only set when an order was not found
+    # Spec 6.1/6.2 inputs from the SME's Z_AGEDINV workbook (None = not loaded for this question):
+    controlled_lookup: dict[str, float] | None = None  # lookup key SLoc+Material -> ControlledRemainingIssuance
+    z67z68: dict[str, float] = field(default_factory=dict)  # lookup key -> Net GI (Other) = Z67/Z68 postings
+    cds_status: dict[str, str] = field(default_factory=dict)  # lookup key -> S43 CDS MaterialStatus (AV/OC/NC)
 
     def add_inventory(self, rows: Iterable[dict]) -> None:
         for rec in rows:
@@ -199,9 +204,14 @@ class LiveSource:
         return (lo[0]["ManufacturingOrder"], hi[0]["ManufacturingOrder"]) if lo and hi else None
 
     def find_material(self, value: str) -> str | None:
+        # The SME report views (Z_AGEDINV4, 14C, PP134) hold far more materials than the planner views.
         for candidate in dict.fromkeys([str(value).strip().upper(), str(value).strip()]):
             for entity, field_name in ((MASTER_SET, "Product"), (INVENTORY_SET, "Material"),
-                                       (COMPONENT_SET, "Material"), (SHORTAGE_SET, "Material")):
+                                       (COMPONENT_SET, "Material"), (SHORTAGE_SET, "Material"),
+                                       (s4.STOCK_LIST.entity_set, "Material"),
+                                       (s4.WO_COMPONENT.entity_set, "Component"),
+                                       (s4.ISSUANCE_14C.entity_set, "Component"),
+                                       (s4.ORDER_MASTER.entity_set, "Material")):
                 hit = self._safe(lambda: self._exists(entity, field_name, candidate))
                 if hit:
                     return hit.upper()
@@ -209,7 +219,7 @@ class LiveSource:
 
     def find_storage_location(self, value: str) -> str | None:
         for candidate in dict.fromkeys([str(value).strip().upper(), str(value).strip()]):
-            for entity in (SLOC_SET, INVENTORY_SET):
+            for entity in (SLOC_SET, INVENTORY_SET, s4.STOCK_LIST.entity_set):
                 hit = self._safe(lambda: self._exists(entity, "StorageLocation", candidate))
                 if hit:
                     return hit.upper()
@@ -283,34 +293,56 @@ class LiveSource:
         return snap
 
     def for_aged(self, threshold: float, materials=(), slocs=()) -> DataRepository:
-        """Stock older than the threshold (filtered by S43) and the open demand for those positions."""
+        """Aged stock from the Z_AGEDINV4 stock list (Sheet1_Data - the SME's aging source, same as the Excel)
+        and the controlled quantity still to issue per position from the WIP issuable sheet (Sheet3).
+
+        With a material filter every position of those materials is read, so the answer can also say
+        that a material is NOT aged (and how old its stock is)."""
         snap = DataRepository()
-        snap.add_inventory(self._fetch("inventory", all_of(
-            f"AgingDays gt {int(threshold)}", any_of("Material", materials) if materials else None,
-            any_of("StorageLocation", slocs) if slocs else None)))
-        self._demand(snap, materials)
+        flt = {"Material": materials, "StorageLocation": slocs}
+        stock = self.report_rows("stock_list", flt, None if materials else f"AgingDays gt {int(threshold)}")
+        demand = {(r["StorageLocation"], r["Material"].upper()): r.get("ControlledRemainingQty")
+                  for r in self.report_rows("issuable_all", flt)}
+        snap.add_inventory({**_stock_row(r),
+                            "ControlledRemainingQty": demand.get((r["StorageLocation"], r["Material"].upper())) or 0}
+                           for r in stock)
+        # A named material that only exists in the planner's Inventory view (not in the stock list).
+        missing = {m.upper() for m in materials} - {r["Material"].upper() for r in stock}
+        if missing:
+            snap.add_inventory(self._fetch("inventory", all_of(
+                any_of("Material", missing), any_of("StorageLocation", slocs) if slocs else None)))
+            self._demand(snap, missing)
         self._names(snap)
         return snap
 
     def for_material_status(self, materials=(), slocs=()) -> DataRepository:
-        """Stock by material/location, narrowed to the line-side locations once their names are known."""
+        """Spec 6.1 / 6.2 inputs, the same as the SME's Z_AGEDINV workbook:
+        * unrestricted stock per SLoc + material  - Sheet1_Data (Z_AGEDINV "Data")
+        * ControlledRemainingIssuance lookup      - Sheet2_WOComponent (sheet "2", SumRemainingQty per key)
+        * Z67/Z68 postings (supplementary)        - Sheet2_WOComponent Net GI (Other)
+        * S43's own CDS result, for verification  - Sheet3_WIPIssuable MaterialStatus
+        """
         snap = DataRepository()
-        snap.add_inventory(self._fetch("inventory", all_of(
-            any_of("Material", materials) if materials else None,
-            any_of("StorageLocation", slocs) if slocs else None)))
+        flt = {"Material": materials, "StorageLocation": slocs}
+        snap.add_inventory(_stock_row(r) for r in self.report_rows("stock_list", flt))
+        req_rows = self.report_rows("wo_component", {"Component": materials, "StorageLocation": slocs})
+        snap.controlled_lookup = rules.controlled_remaining_lookup(req_rows)
+        for r in req_rows:
+            key = rules.lookup_key(r["StorageLocation"], r["Component"])
+            snap.z67z68[key] = round(snap.z67z68.get(key, 0) + (r.get("NetGIOther") or 0), 3)
+        snap.cds_status = {rules.lookup_key(r["StorageLocation"], r["Material"]): r.get("MaterialStatus")
+                           for r in self.report_rows("issuable_all", flt)}
         self._names(snap)
-        line_side = {i["StorageLocation"] for i in snap.inventory if snap.is_line_side(i["StorageLocation"])}
-        snap.inventory = [i for i in snap.inventory if i["StorageLocation"] in line_side]
-        snap.inventory_by_material = defaultdict(list)
-        for i in snap.inventory:
-            snap.inventory_by_material[i["Material"].upper()].append(i)
-        self._demand(snap, materials, line_side)
         return snap
 
     def for_material(self, material: str) -> DataRepository:
         snap = DataRepository()
         snap.add_master(self._fetch("material_master", eq("Product", material)))
         snap.add_inventory(self._fetch("inventory", eq("Material", material)))
+        if not snap.inventory:  # not in the planner's Inventory view: Z_AGEDINV stock list + 6.1 lookup
+            snap.add_inventory(_stock_row(r) for r in self.report_rows("stock_list", {"Material": [material]}))
+            snap.controlled_lookup = rules.controlled_remaining_lookup(
+                self.report_rows("wo_component", {"Component": [material]}))
         snap.shortage_by_order = self._work_orders(None, self._orders_with_material([material]))
         self._names(snap)
         return snap
@@ -379,6 +411,18 @@ class LiveSource:
 
         with ThreadPoolExecutor(max_workers=min(4, len(todo))) as pool:
             snap.storage_location_names.update(pool.map(one, todo))
+
+
+def _stock_row(r: dict) -> dict:
+    """Z_AGEDINV stock-list row (Sheet1_Data) in the shape of an Inventory record.
+    Unrestricted = Unrestricted + Unrestricted consignment (the Excel's "Sum Unrestricted")."""
+    return {
+        "Material": r["Material"], "StorageLocation": r["StorageLocation"],
+        "ProductDescription": r.get("MaterialDescription"), "BaseUnit": r.get("BaseUnitOfMeasure"),
+        "AgingDays": r.get("AgingDays"), "LastPlacementDate": r.get("LastPlacementDate"),
+        "Unrestricted": round((r.get("Unrestricted") or 0) + (r.get("UnrestrictedConsignment") or 0), 3),
+        "UnrestrictedStockValue": r.get("UnRestrictStkVal"), "Currency": r.get("Currency"),
+    }
 
 
 def _destination_client(config) -> ODataClient:
